@@ -164,6 +164,41 @@ describe("WorkspaceEditor", () => {
 		},
 	);
 
+	test.skipIf(!hasBwrap)(
+		"concurrent editFile calls on the same file both land",
+		async () => {
+			// Regression: editFile's read-modify-write (runReadFile then runCreateFile)
+			// was not serialized, so two overlapping edit_file tool calls on the same
+			// file could both read the pre-edit content and the second write would
+			// silently clobber the first.
+			const root = await createTempDir("justclaw-ws-");
+			const editor = new WorkspaceEditor(root, historyDirForWorkspace(root));
+			const filePath = path.join(root, "doc.txt");
+			await editor.createFile({
+				type: "create_file",
+				path: filePath,
+				diff: "alpha\nbeta\n",
+			});
+			const [r1, r2] = await Promise.all([
+				editor.editFile({
+					type: "edit_file",
+					path: filePath,
+					old: "alpha",
+					new: "ALPHA",
+				}),
+				editor.editFile({
+					type: "edit_file",
+					path: filePath,
+					old: "beta",
+					new: "BETA",
+				}),
+			]);
+			expect(r1.status).toBe("completed");
+			expect(r2.status).toBe("completed");
+			expect(await Bun.file(filePath).text()).toBe("ALPHA\nBETA\n");
+		},
+	);
+
 	test.skipIf(!hasSandbox)(
 		"runReadFileBase64 round-trips binary bytes (attach_image/attach_file)",
 		async () => {

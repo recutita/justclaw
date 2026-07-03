@@ -372,6 +372,10 @@ export class WorkspaceEditor {
 	readonly #characterDir?: string;
 	readonly #modulesRoot?: string;
 	readonly #skillsDir?: string;
+	// The agents SDK may execute tool calls in parallel, but editFile's read-modify-write
+	// (runReadFile then runCreateFile) is not atomic. Chaining every mutating op through
+	// this promise serializes them so concurrent calls apply in order instead of racing.
+	#queue: Promise<unknown> = Promise.resolve();
 
 	constructor(
 		workspaceDir: string,
@@ -389,29 +393,39 @@ export class WorkspaceEditor {
 		this.#skillsDir = skillsDir;
 	}
 
+	#serialize<T>(fn: () => Promise<T>): Promise<T> {
+		const run = this.#queue.then(fn, fn);
+		// Keep the chain alive even if this op failed; the failure is still
+		// delivered to this call's caller via `run`.
+		this.#queue = run.catch(() => undefined);
+		return run;
+	}
+
 	async createFile(
 		op: Extract<ApplyPatchOperation, { type: "create_file" }>,
 	): Promise<ApplyPatchResult> {
-		const resolved = path.resolve(op.path);
-		// op.diff carries the file content for create_file (passed as the "content" field
-		// by createWorkspaceTools; the Editor interface reuses the diff field).
-		const result = await runCreateFile(
-			this.#workspaceDir,
-			this.#historyDir,
-			this.#platform,
-			resolved,
-			op.diff,
-			this.#characterDir,
-			this.#modulesRoot,
-			this.#skillsDir,
-		);
-		if (!result.ok) {
-			return {
-				status: "failed",
-				output: result.stderr.trim() || "create failed",
-			};
-		}
-		return { status: "completed" };
+		return this.#serialize(async () => {
+			const resolved = path.resolve(op.path);
+			// op.diff carries the file content for create_file (passed as the "content" field
+			// by createWorkspaceTools; the Editor interface reuses the diff field).
+			const result = await runCreateFile(
+				this.#workspaceDir,
+				this.#historyDir,
+				this.#platform,
+				resolved,
+				op.diff,
+				this.#characterDir,
+				this.#modulesRoot,
+				this.#skillsDir,
+			);
+			if (!result.ok) {
+				return {
+					status: "failed",
+					output: result.stderr.trim() || "create failed",
+				};
+			}
+			return { status: "completed" };
+		});
 	}
 
 	async editFile(op: {
@@ -420,40 +434,44 @@ export class WorkspaceEditor {
 		old: string;
 		new: string;
 	}): Promise<ApplyPatchResult> {
-		const resolved = path.resolve(op.path);
-		return runEditFile(
-			this.#workspaceDir,
-			this.#historyDir,
-			this.#platform,
-			resolved,
-			op.old,
-			op.new,
-			this.#characterDir,
-			this.#modulesRoot,
-			this.#skillsDir,
-		);
+		return this.#serialize(() => {
+			const resolved = path.resolve(op.path);
+			return runEditFile(
+				this.#workspaceDir,
+				this.#historyDir,
+				this.#platform,
+				resolved,
+				op.old,
+				op.new,
+				this.#characterDir,
+				this.#modulesRoot,
+				this.#skillsDir,
+			);
+		});
 	}
 
 	async deleteFile(
 		op: Extract<ApplyPatchOperation, { type: "delete_file" }>,
 	): Promise<ApplyPatchResult> {
-		const resolved = path.resolve(op.path);
-		const result = await runDeleteFile(
-			this.#workspaceDir,
-			this.#historyDir,
-			this.#platform,
-			resolved,
-			this.#characterDir,
-			this.#modulesRoot,
-			this.#skillsDir,
-		);
-		if (!result.ok) {
-			return {
-				status: "failed",
-				output: result.stderr.trim() || "delete failed",
-			};
-		}
-		return { status: "completed" };
+		return this.#serialize(async () => {
+			const resolved = path.resolve(op.path);
+			const result = await runDeleteFile(
+				this.#workspaceDir,
+				this.#historyDir,
+				this.#platform,
+				resolved,
+				this.#characterDir,
+				this.#modulesRoot,
+				this.#skillsDir,
+			);
+			if (!result.ok) {
+				return {
+					status: "failed",
+					output: result.stderr.trim() || "delete failed",
+				};
+			}
+			return { status: "completed" };
+		});
 	}
 }
 
