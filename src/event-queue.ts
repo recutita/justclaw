@@ -11,10 +11,25 @@ export type QueuedEvent = {
 export const ACTIVE_SESSION_META_KEY = "active_session_id";
 export const LAST_REPLYABLE_TARGET_META_KEY = "last_replyable_target";
 
+// local wall-clock ISO8601 with an explicit numeric offset. Never "Z", never a
+// naked local time: a reader (LLM or module) must not have to infer the zone.
+export function formatLocalTimestamp(ms: number): string {
+	const d = new Date(ms);
+	const pad = (n: number) => String(n).padStart(2, "0");
+	const offMin = -d.getTimezoneOffset(); // JST => +540
+	const sign = offMin >= 0 ? "+" : "-";
+	const abs = Math.abs(offMin);
+	const offset = `${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+	return (
+		`${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
+		`T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}${offset}`
+	);
+}
+
 export function timestampFromUUIDv7(uuid: string): string {
-	return new Date(
+	return formatLocalTimestamp(
 		parseInt(uuid.replace(/-/g, "").slice(0, 12), 16),
-	).toISOString();
+	);
 }
 
 export function resolveEventQueuePath(
