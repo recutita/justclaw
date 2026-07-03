@@ -1470,6 +1470,9 @@ export async function runLlmLoop(
 		// The abortSignal may have fired while this iteration was blocked in
 		// `await eventQueue.next()`, before currentRunController pointed at it.
 		if (options?.abortSignal?.aborted) runController.abort();
+		// Snapshot so a dropped turn (save failure below) can be rolled back
+		// and not later persisted/replayed on a subsequent event.
+		const historyBefore = session.history;
 		try {
 			// Build the LLM input inside the try so an invalid payload (e.g. a
 			// key eventToXml rejects) is dropped like any other per-event failure
@@ -1565,6 +1568,10 @@ export async function runLlmLoop(
 			console.error(
 				`[core] LLM cycle failed: ${error instanceof Error ? error.message : String(error)}`,
 			);
+			// The turn is dropped, so discard its in-memory history mutation;
+			// otherwise a failed save would still leave the turn to be persisted
+			// on a later event and re-processed after re-emit.
+			session.history = historyBefore;
 			notifyEventDropped(daemonsRef.current, event);
 			if (!isInterrupt) eventQueue.complete(event.id);
 		} finally {

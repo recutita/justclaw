@@ -1733,6 +1733,55 @@ describe("runLlmLoop", () => {
 		expect(types).not.toContain("message.send.v1");
 	});
 
+	test("rolls back in-memory history when the session save fails", async () => {
+		const home = await createTempDir("justclaw-llm-save-rollback-");
+		const dbPath = path.join(home, "events.db");
+		const active = "01900000-0000-7000-8000-0000000000aa";
+		let saveCalls = 0;
+		const sessionStore = {
+			newestReadableSessionId: () => active,
+			load: async () => [],
+			save: async () => {
+				saveCalls++;
+				if (saveCalls === 1) {
+					throw new Error("save exploded");
+				}
+			},
+		} as unknown as SessionStore;
+
+		const queue = new EventQueue(dbPath);
+		queue.setMeta("active_session_id", active);
+		queue.enqueue("srcmod", { type: "event.v1", kind: "first" });
+		queue.enqueue("srcmod", { type: "event.v1", kind: "second" });
+
+		const capturedInputs: unknown[] = [];
+		let runCount = 0;
+		const mockRunner = {
+			run: async (_agent: unknown, input: unknown) => {
+				runCount++;
+				capturedInputs.push(input);
+				if (runCount === 1) {
+					return {
+						finalOutput: null,
+						history: [{ role: "user", content: "turn1" } as AgentInputItem],
+					};
+				}
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
+			runner: mockRunner,
+			sessionStore,
+		});
+		await waitUntil(() => runCount >= 2);
+		queue.close();
+		await loopTask;
+
+		// The second event must not carry the first turn, whose save failed.
+		expect(JSON.stringify(capturedInputs[1])).not.toContain("turn1");
+	});
+
 	test("restart_modules keeps character INIT injection for new sessions", async () => {
 		const home = await createTempDir("justclaw-llm-restart-init-");
 		const modulesRoot = path.join(home, "modules");
