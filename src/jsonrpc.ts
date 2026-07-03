@@ -306,13 +306,38 @@ export class JsonRpcPeer {
 	}
 }
 
+const DEFAULT_MAX_LINE_BYTES = 64 * 1024 * 1024;
+
+// A generous cap, not a protocol limit: legitimate image.send.v1/file.send.v1
+// events are single NDJSON lines carrying multi-MB base64 payloads. Without a
+// cap, a module that never emits a newline (buggy or malicious) would grow
+// `buffer` without bound and OOM the core.
+function resolveMaxLineBytes(): number {
+	const raw = process.env.JUSTCLAW_MAX_LINE_BYTES;
+	if (raw === undefined || raw === "") {
+		return DEFAULT_MAX_LINE_BYTES;
+	}
+	const parsed = Number(raw);
+	if (!Number.isInteger(parsed) || parsed <= 0) {
+		console.error(
+			`JUSTCLAW_MAX_LINE_BYTES must be a positive integer, got ${JSON.stringify(raw)}; using default ${DEFAULT_MAX_LINE_BYTES}`,
+		);
+		return DEFAULT_MAX_LINE_BYTES;
+	}
+	return parsed;
+}
+
 export async function consumeLines(
 	stream: ReadableStream<Uint8Array>,
 	onLine: (line: string) => void,
 ): Promise<void> {
 	const reader = stream.getReader();
 	const decoder = new TextDecoder();
+	const maxLineBytes = resolveMaxLineBytes();
 	let buffer = "";
+	// True while the current (undelimited) line has already exceeded the
+	// limit and is being dropped up to the next newline.
+	let discardingLine = false;
 
 	while (true) {
 		const { done, value } = await reader.read();
@@ -325,18 +350,43 @@ export async function consumeLines(
 		let newlineIndex = buffer.indexOf("\n");
 		while (newlineIndex >= 0) {
 			const rawLine = buffer.slice(0, newlineIndex);
-			const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
 			buffer = buffer.slice(newlineIndex + 1);
-			if (line.length > 0) {
-				onLine(line);
+			if (discardingLine) {
+				// The rest of an already-oversized line; drop it too.
+				discardingLine = false;
+			} else if (Buffer.byteLength(rawLine) > maxLineBytes) {
+				// The line arrived complete (newline included) in one chunk,
+				// so it was never caught by the growing-buffer check below.
+				console.error(
+					`jsonrpc: line exceeds ${maxLineBytes} bytes; discarding and resuming at next newline`,
+				);
+			} else {
+				const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+				if (line.length > 0) {
+					onLine(line);
+				}
 			}
 			newlineIndex = buffer.indexOf("\n");
 		}
+
+		if (discardingLine) {
+			// No newline yet for the line being discarded; drop what we have
+			// so the buffer doesn't keep growing while we wait for one.
+			buffer = "";
+		} else if (Buffer.byteLength(buffer) > maxLineBytes) {
+			console.error(
+				`jsonrpc: line exceeds ${maxLineBytes} bytes; discarding and resuming at next newline`,
+			);
+			buffer = "";
+			discardingLine = true;
+		}
 	}
 
-	buffer += decoder.decode();
-	const finalLine = buffer.endsWith("\r") ? buffer.slice(0, -1) : buffer;
-	if (finalLine.length > 0) {
-		onLine(finalLine);
+	if (!discardingLine) {
+		buffer += decoder.decode();
+		const finalLine = buffer.endsWith("\r") ? buffer.slice(0, -1) : buffer;
+		if (finalLine.length > 0) {
+			onLine(finalLine);
+		}
 	}
 }

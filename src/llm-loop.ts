@@ -754,6 +754,32 @@ function wrapWithNotification(
 	};
 }
 
+// Resolve/reject with the module tool request, but reject early if the run's
+// abort signal fires first. A hung-but-alive module has no timeout of its own,
+// so without this a stuck request would stall the single serial queue forever
+// and sessions.skip.v1 could not recover it. Rejecting unwinds runner.run so the
+// normal abort -> event.dropped.v1 path runs.
+function requestWithAbort(
+	request: Promise<unknown>,
+	signal: AbortSignal | undefined,
+): Promise<unknown> {
+	if (!signal) {
+		return request;
+	}
+	return new Promise<unknown>((resolve, reject) => {
+		const onAbort = () =>
+			reject(new Error("run aborted before module tool responded"));
+		if (signal.aborted) {
+			onAbort();
+			return;
+		}
+		signal.addEventListener("abort", onAbort, { once: true });
+		request
+			.then(resolve, reject)
+			.finally(() => signal.removeEventListener("abort", onAbort));
+	});
+}
+
 function buildModuleTools(
 	daemons: StartedDaemon[],
 	delivery: ToolResultDelivery,
@@ -766,10 +792,10 @@ function buildModuleTools(
 				// biome-ignore lint/suspicious/noExplicitAny: avoid @openai/agents-core subpath types for parameters
 				parameters: toolDef.parameters as any,
 				strict: false,
-				execute: async (input: unknown) => {
-					const result = await daemon.peer.request(
-						`tool/${toolDef.name}`,
-						input ?? {},
+				execute: async (input: unknown, _context, details) => {
+					const result = await requestWithAbort(
+						daemon.peer.request(`tool/${toolDef.name}`, input ?? {}),
+						details?.signal,
 					);
 					return prepareToolResultForLlm(result, delivery);
 				},
@@ -1148,6 +1174,9 @@ export async function runLlmLoop(
 						initializeTimeoutMs: options.initializeTimeoutMs,
 						abortSignal: options.abortSignal,
 						timerSchedulerRef: options.timerSchedulerRef,
+						// Without characterDir the reloaded daemons' session-request
+						// handlers stop injecting INIT.md for new sessions.
+						characterDir: options.characterDir,
 					});
 					const rawContinuation =
 						(input as { continuation: string }).continuation ?? "";
@@ -1432,47 +1461,6 @@ export async function runLlmLoop(
 				return { isFinalOutput: false, isInterrupted: undefined };
 			},
 		});
-		const eventForInput = await prepareImageEventForInput(event);
-		const xml = eventToXml(eventForInput);
-		const userInput: AgentInputItem =
-			eventForInput.params.type === "image.send.v1"
-				? ({
-						role: "user",
-						content: [
-							{ type: "input_text", text: xml },
-							{
-								type: "input_image",
-								image: `data:${String(eventForInput.params.mediaType)};base64,${String(eventForInput.params.data)}`,
-							},
-						],
-					} as AgentInputItem)
-				: eventForInput.params.type === "file.send.v1"
-					? ({
-							role: "user",
-							content: [
-								{ type: "input_text", text: xml },
-								{
-									type: "input_file",
-									file: `data:${String(eventForInput.params.mediaType)};base64,${String(eventForInput.params.data)}`,
-									...(typeof eventForInput.params.filename === "string"
-										? { filename: eventForInput.params.filename }
-										: {}),
-								},
-							],
-						} as AgentInputItem)
-					: eventForInput.params.type === "audio.send.v1"
-						? ({
-								role: "user",
-								content: [
-									{ type: "input_text", text: xml },
-									{
-										type: "audio",
-										audio: String(eventForInput.params.data),
-										format: inferAudioFormat(eventForInput.params),
-									},
-								],
-							} as AgentInputItem)
-						: ({ role: "user", content: xml } as AgentInputItem);
 
 		const runController = new AbortController();
 		// Propagate the process-level abort into the per-run controller so that
@@ -1482,7 +1470,55 @@ export async function runLlmLoop(
 		// The abortSignal may have fired while this iteration was blocked in
 		// `await eventQueue.next()`, before currentRunController pointed at it.
 		if (options?.abortSignal?.aborted) runController.abort();
+		// Snapshot so a dropped turn (save failure below) can be rolled back
+		// and not later persisted/replayed on a subsequent event.
+		const historyBefore = session.history;
 		try {
+			// Build the LLM input inside the try so an invalid payload (e.g. a
+			// key eventToXml rejects) is dropped like any other per-event failure
+			// instead of throwing out of runLlmLoop and killing the whole loop.
+			const eventForInput = await prepareImageEventForInput(event);
+			const xml = eventToXml(eventForInput);
+			const userInput: AgentInputItem =
+				eventForInput.params.type === "image.send.v1"
+					? ({
+							role: "user",
+							content: [
+								{ type: "input_text", text: xml },
+								{
+									type: "input_image",
+									image: `data:${String(eventForInput.params.mediaType)};base64,${String(eventForInput.params.data)}`,
+								},
+							],
+						} as AgentInputItem)
+					: eventForInput.params.type === "file.send.v1"
+						? ({
+								role: "user",
+								content: [
+									{ type: "input_text", text: xml },
+									{
+										type: "input_file",
+										file: `data:${String(eventForInput.params.mediaType)};base64,${String(eventForInput.params.data)}`,
+										...(typeof eventForInput.params.filename === "string"
+											? { filename: eventForInput.params.filename }
+											: {}),
+									},
+								],
+							} as AgentInputItem)
+						: eventForInput.params.type === "audio.send.v1"
+							? ({
+									role: "user",
+									content: [
+										{ type: "input_text", text: xml },
+										{
+											type: "audio",
+											audio: String(eventForInput.params.data),
+											format: inferAudioFormat(eventForInput.params),
+										},
+									],
+								} as AgentInputItem)
+							: ({ role: "user", content: xml } as AgentInputItem);
+
 			const runInput: string | AgentInputItem[] =
 				session.history.length > 0
 					? [...session.history, userInput]
@@ -1493,10 +1529,33 @@ export async function runLlmLoop(
 				signal: runController.signal,
 				maxTurns,
 			});
+			// A sessions.skip.v1 that aborted this run — including the narrow window
+			// where the run resolved just before the abort landed — must yield a
+			// dropped event, not a delivered reply. Past this point the run is
+			// committed: the controller is unregistered so a later skip is a no-op
+			// (the save/deliver window is intentionally not abortable).
+			if (runController.signal.aborted) {
+				notifyEventDropped(daemonsRef.current, event);
+				if (!isInterrupt) eventQueue.complete(event.id);
+				continue;
+			}
+			eventQueue.setRunController(null);
 			const text = result.finalOutput;
 			session.history = sanitizeHistoryForStorage(result.history);
 			if (sessionStore && session.currentSessionId !== null) {
-				if (await shouldPersistCurrentSession(session, eventQueue)) {
+				// Re-check liveness immediately before writing. sessions.delete.v1
+				// removes the history file mid-run; the completing turn must not
+				// recreate it (spec: deleted sessions are never written again).
+				// active_session_id alone is insufficient because the delete removes
+				// the file before it clears that metadata, so also confirm the file
+				// still exists.
+				const stillActive =
+					session.currentSessionId ===
+					eventQueue.getMeta(ACTIVE_SESSION_META_KEY);
+				const stillOnDisk =
+					stillActive &&
+					(await sessionStore.load(session.currentSessionId)) !== null;
+				if (stillOnDisk) {
 					await sessionStore.save(session.currentSessionId, session.history);
 				} else {
 					resetSessionState(session);
@@ -1521,6 +1580,10 @@ export async function runLlmLoop(
 			console.error(
 				`[core] LLM cycle failed: ${error instanceof Error ? error.message : String(error)}`,
 			);
+			// The turn is dropped, so discard its in-memory history mutation;
+			// otherwise a failed save would still leave the turn to be persisted
+			// on a later event and re-processed after re-emit.
+			session.history = historyBefore;
 			notifyEventDropped(daemonsRef.current, event);
 			if (!isInterrupt) eventQueue.complete(event.id);
 		} finally {

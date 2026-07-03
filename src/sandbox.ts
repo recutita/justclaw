@@ -339,6 +339,13 @@ function isPathCovered(
 	return false;
 }
 
+function isPathCoveredByAny(
+	candidatePath: string,
+	...rootSets: Iterable<string>[]
+): boolean {
+	return rootSets.some((roots) => isPathCovered(candidatePath, roots));
+}
+
 /**
  * Parses a colon-separated env var (JUSTCLAW_SANDBOX_RO_PATHS / _RW_PATHS) into
  * a list of absolute, normalized, existing paths. These come from the operator
@@ -441,21 +448,25 @@ export async function createLinuxBubblewrapCommand(
 		"--new-session",
 		"--unshare-pid",
 	];
-	const mountedRoots = new Set<string>();
+	// Tracked separately (rather than one combined set) so an operator RW path
+	// nested under a standard RO root (e.g. /etc/myagent under /etc) is not
+	// mistaken for "already covered" and silently downgraded to read-only.
+	const roRoots = new Set<string>();
+	const rwRoots = new Set<string>();
 
 	for (const readonlyPath of LINUX_READONLY_PATHS) {
 		if (await pathExists(readonlyPath)) {
 			appendReadonlyMount(cmd, readonlyPath);
-			mountedRoots.add(readonlyPath);
+			roRoots.add(readonlyPath);
 		}
 	}
 
 	if (await pathExists("/etc/resolv.conf")) {
 		try {
 			const resolverPath = await realPath("/etc/resolv.conf");
-			if (!isPathCovered(resolverPath, mountedRoots)) {
+			if (!isPathCoveredByAny(resolverPath, roRoots, rwRoots)) {
 				appendReadonlyFileMount(cmd, resolverPath);
-				mountedRoots.add(resolverPath);
+				roRoots.add(resolverPath);
 			}
 		} catch {}
 	}
@@ -467,7 +478,7 @@ export async function createLinuxBubblewrapCommand(
 			);
 		}
 		appendWritableMount(cmd, writablePath);
-		mountedRoots.add(writablePath);
+		rwRoots.add(writablePath);
 	}
 
 	// Covers the common case of a module written in the same runtime as the
@@ -475,25 +486,35 @@ export async function createLinuxBubblewrapCommand(
 	// parsing module-controlled shebangs.
 	const coreRuntimeDir = path.dirname(process.execPath);
 	if (
-		!isPathCovered(coreRuntimeDir, mountedRoots) &&
+		!isPathCoveredByAny(coreRuntimeDir, roRoots, rwRoots) &&
 		(await pathExists(coreRuntimeDir))
 	) {
 		appendReadonlyMount(cmd, coreRuntimeDir);
-		mountedRoots.add(coreRuntimeDir);
+		roRoots.add(coreRuntimeDir);
 	}
 
 	const operatorMounts = await resolveOperatorSandboxMounts(env, pathExists);
 	for (const readonlyPath of operatorMounts.readonlyPaths) {
-		if (!isPathCovered(readonlyPath, mountedRoots)) {
+		if (!isPathCoveredByAny(readonlyPath, roRoots, rwRoots)) {
 			appendReadonlyMount(cmd, readonlyPath);
-			mountedRoots.add(readonlyPath);
+			roRoots.add(readonlyPath);
 		}
 	}
 	for (const readWritePath of operatorMounts.readWritePaths) {
-		if (!isPathCovered(readWritePath, mountedRoots)) {
-			appendWritableMount(cmd, readWritePath);
-			mountedRoots.add(readWritePath);
+		if (isPathCovered(readWritePath, rwRoots)) {
+			continue;
 		}
+		// Covered only by a RO root (e.g. operator asked for /etc/myagent rw,
+		// but /etc is already ro-bound): still emit the --bind. bwrap applies
+		// binds in order, so this later --bind makes the subpath writable,
+		// overriding the earlier --ro-bind of its parent.
+		if (isPathCovered(readWritePath, roRoots)) {
+			console.error(
+				`JUSTCLAW_SANDBOX_RW_PATHS: "${readWritePath}" overlaps a read-only sandbox root; mounting it read-write (overrides the read-only parent for this subpath)`,
+			);
+		}
+		appendWritableMount(cmd, readWritePath);
+		rwRoots.add(readWritePath);
 	}
 
 	cmd.push(
@@ -527,21 +548,25 @@ export async function createLinuxWorkspaceBwrapCommand(
 		"--new-session",
 		"--unshare-pid",
 	];
-	const mountedRoots = new Set<string>();
+	// Tracked separately (rather than one combined set) so an operator RW path
+	// nested under a standard RO root (e.g. /etc/myagent under /etc) is not
+	// mistaken for "already covered" and silently downgraded to read-only.
+	const roRoots = new Set<string>();
+	const rwRoots = new Set<string>();
 
 	for (const readonlyPath of LINUX_READONLY_PATHS) {
 		if (await pathExists(readonlyPath)) {
 			appendReadonlyMount(cmd, readonlyPath);
-			mountedRoots.add(readonlyPath);
+			roRoots.add(readonlyPath);
 		}
 	}
 
 	if (await pathExists("/etc/resolv.conf")) {
 		try {
 			const resolverPath = await realPath("/etc/resolv.conf");
-			if (!isPathCovered(resolverPath, mountedRoots)) {
+			if (!isPathCoveredByAny(resolverPath, roRoots, rwRoots)) {
 				appendReadonlyFileMount(cmd, resolverPath);
-				mountedRoots.add(resolverPath);
+				roRoots.add(resolverPath);
 			}
 		} catch {}
 	}
@@ -552,7 +577,7 @@ export async function createLinuxWorkspaceBwrapCommand(
 		);
 	}
 	appendWritableMount(cmd, workspaceDir);
-	mountedRoots.add(workspaceDir);
+	rwRoots.add(workspaceDir);
 
 	const characterDir = options.characterDir;
 	if (
@@ -561,7 +586,7 @@ export async function createLinuxWorkspaceBwrapCommand(
 		(await pathExists(characterDir))
 	) {
 		appendWritableMount(cmd, characterDir);
-		mountedRoots.add(characterDir);
+		rwRoots.add(characterDir);
 	}
 
 	const modulesRoot = options.modulesRoot;
@@ -571,7 +596,7 @@ export async function createLinuxWorkspaceBwrapCommand(
 		(await pathExists(modulesRoot))
 	) {
 		appendWritableMount(cmd, modulesRoot);
-		mountedRoots.add(modulesRoot);
+		rwRoots.add(modulesRoot);
 	}
 
 	const skillsDir = options.skillsDir;
@@ -581,13 +606,13 @@ export async function createLinuxWorkspaceBwrapCommand(
 		(await pathExists(skillsDir))
 	) {
 		appendWritableMount(cmd, skillsDir);
-		mountedRoots.add(skillsDir);
+		rwRoots.add(skillsDir);
 	}
 
 	if (bindHistoryDir) {
 		if (await pathExists(historyDir)) {
 			appendReadonlyMount(cmd, historyDir);
-			mountedRoots.add(historyDir);
+			roRoots.add(historyDir);
 		}
 	}
 
@@ -598,20 +623,30 @@ export async function createLinuxWorkspaceBwrapCommand(
 		);
 	}
 	appendWritableMount(cmd, tmpPath);
-	mountedRoots.add(tmpPath);
+	rwRoots.add(tmpPath);
 
 	const operatorMounts = await resolveOperatorSandboxMounts(env, pathExists);
 	for (const readonlyPath of operatorMounts.readonlyPaths) {
-		if (!isPathCovered(readonlyPath, mountedRoots)) {
+		if (!isPathCoveredByAny(readonlyPath, roRoots, rwRoots)) {
 			appendReadonlyMount(cmd, readonlyPath);
-			mountedRoots.add(readonlyPath);
+			roRoots.add(readonlyPath);
 		}
 	}
 	for (const readWritePath of operatorMounts.readWritePaths) {
-		if (!isPathCovered(readWritePath, mountedRoots)) {
-			appendWritableMount(cmd, readWritePath);
-			mountedRoots.add(readWritePath);
+		if (isPathCovered(readWritePath, rwRoots)) {
+			continue;
 		}
+		// Covered only by a RO root (e.g. operator asked for /etc/myagent rw,
+		// but /etc is already ro-bound): still emit the --bind. bwrap applies
+		// binds in order, so this later --bind makes the subpath writable,
+		// overriding the earlier --ro-bind of its parent.
+		if (isPathCovered(readWritePath, roRoots)) {
+			console.error(
+				`JUSTCLAW_SANDBOX_RW_PATHS: "${readWritePath}" overlaps a read-only sandbox root; mounting it read-write (overrides the read-only parent for this subpath)`,
+			);
+		}
+		appendWritableMount(cmd, readWritePath);
+		rwRoots.add(readWritePath);
 	}
 
 	cmd.push("--proc", "/proc", "--dev", "/dev", "--chdir", workspaceDir, "--");

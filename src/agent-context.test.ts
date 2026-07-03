@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -98,6 +98,44 @@ describe("loadAgentContext", () => {
 		} finally {
 			await rm(dir, { recursive: true, force: true });
 		}
+	});
+
+	describe("concurrent removal", () => {
+		afterEach(() => {
+			// biome-ignore lint/suspicious/noExplicitAny: restoring a spy on a global
+			(Bun.file as any).mockRestore?.();
+		});
+
+		test("treats a file removed between check and read as absent, not fatal", async () => {
+			const dir = await mkdtemp(path.join(os.tmpdir(), "justclaw-ch-"));
+			try {
+				await Bun.write(path.join(dir, "SOUL.md"), "kept");
+				await Bun.write(path.join(dir, "IDENTITY.md"), "identity");
+				const enoent = Object.assign(new Error("ENOENT: no such file"), {
+					code: "ENOENT",
+				});
+				const originalFile = Bun.file.bind(Bun);
+				spyOn(Bun, "file").mockImplementation((...args: unknown[]) => {
+					// biome-ignore lint/suspicious/noExplicitAny: passthrough to the real Bun.file
+					const real = originalFile(...(args as [any]));
+					if (typeof args[0] === "string" && args[0].endsWith("IDENTITY.md")) {
+						// Simulate IDENTITY.md being deleted after exists() confirmed
+						// it but before text() reads it: exists() still reports true
+						// (delegates to the real, still-existing-on-disk file), while
+						// text() rejects as if the file vanished mid-read.
+						return {
+							exists: () => real.exists(),
+							text: () => Promise.reject(enoent),
+							// biome-ignore lint/suspicious/noExplicitAny: minimal fake BunFile for this test
+						} as any;
+					}
+					return real;
+				});
+				expect(await loadAgentContext(dir)).toBe("<SOUL.md>\nkept\n</SOUL.md>");
+			} finally {
+				await rm(dir, { recursive: true, force: true });
+			}
+		});
 	});
 
 	test("outputs SOUL, IDENTITY, MEMORY in that order when AGENTS and USER are missing", async () => {

@@ -163,10 +163,21 @@ function parseInitializeResult(
 	}
 
 	return tools.map((t, i) => {
-		if (typeof (t as { name?: unknown })?.name !== "string") {
+		const raw = t as { name?: unknown; parameters?: unknown };
+		if (typeof raw?.name !== "string") {
 			throw new Error(`${moduleName}: tool[${i}].name must be a string`);
 		}
-		return t as ToolDefinition;
+		// The wire protocol allows a tool to omit "parameters" (docs/spec.md), but
+		// the SDK's tool() requires a JSON schema object and throws otherwise, outside
+		// the per-event try. Default it here so an omitted "parameters" can't crash
+		// the core the next time this module's tools are built for the LLM.
+		const parameters =
+			typeof raw.parameters === "object" &&
+			raw.parameters !== null &&
+			!Array.isArray(raw.parameters)
+				? (raw.parameters as Record<string, unknown>)
+				: { type: "object", properties: {} };
+		return { ...(t as ToolDefinition), parameters };
 	});
 }
 
@@ -286,7 +297,17 @@ async function pipeStdout(
 ): Promise<void> {
 	try {
 		await consumeLines(daemon.process.stdout, (line) => {
-			daemon.peer.handleLine(line);
+			// A single bad line (malformed JSON, unknown notification method, etc.)
+			// must not tear down consumeLines: that would silently drop every valid
+			// message buffered after it and fail an otherwise-healthy daemon. Mirrors
+			// the resilience JsonRpcPeer already applies on the response side.
+			try {
+				daemon.peer.handleLine(line);
+			} catch (error) {
+				console.error(
+					`[${daemon.manifest.name}] ignoring bad stdout line: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
 		});
 		const error = new Error(
 			`${daemon.manifest.name}: stdout closed unexpectedly`,
@@ -625,8 +646,7 @@ async function restartFailedDaemon(
 		return;
 	}
 
-	const daemonIndex = daemons.indexOf(daemon);
-	if (daemonIndex < 0) {
+	if (!daemons.includes(daemon)) {
 		return;
 	}
 
@@ -634,7 +654,14 @@ async function restartFailedDaemon(
 		console.error(
 			`[${daemon.manifest.name}] daemon failed after restart: ${error.message}`,
 		);
-		daemons.splice(daemonIndex, 1);
+		// Re-resolve the index right before mutating: a concurrent failure
+		// elsewhere in daemons can splice entries and shift positions while this
+		// function was awaiting above, so an index captured earlier can point at
+		// the wrong (or a since-shifted) entry by the time we act on it.
+		const idx = daemons.indexOf(daemon);
+		if (idx >= 0) {
+			daemons.splice(idx, 1);
+		}
 		return;
 	}
 
@@ -676,11 +703,15 @@ async function restartFailedDaemon(
 				);
 			},
 		});
-		if (daemon.state !== "failed" || daemons[daemonIndex] !== daemon) {
+		// Re-resolve the index here too: startDaemon() above awaited, giving
+		// concurrent failures room to splice daemons and shift this daemon's
+		// position (or remove it) since we last looked.
+		const idx = daemons.indexOf(daemon);
+		if (daemon.state !== "failed" || idx < 0 || daemons[idx] !== daemon) {
 			await stopDaemon(replacement);
 			return;
 		}
-		daemons[daemonIndex] = replacement;
+		daemons[idx] = replacement;
 		superviseDaemon(replacement, options, daemons, eventQueue);
 		console.error(`[${daemon.manifest.name}] restarted after failure`);
 	} catch (restartError) {
@@ -781,7 +812,10 @@ export async function reloadModules(
 			timerManifests,
 			eventQueue,
 			options.sessionStore,
-			{ initializeTimeoutMs: options.initializeTimeoutMs },
+			{
+				initializeTimeoutMs: options.initializeTimeoutMs,
+				characterDir: options.characterDir,
+			},
 		);
 		console.error(
 			`[core] reloaded: ${daemonsRef.current.length} daemon(s), ${timerManifests.length} timer(s)`,
@@ -840,6 +874,7 @@ export async function bootstrapRuntime(
 			timerManifests,
 			eventQueue,
 			options.sessionStore,
+			{ characterDir: options.characterDir },
 		);
 		console.error(
 			`[core] started: ${startupRef.current.length} daemon(s), ${timerManifests.length} timer(s)`,

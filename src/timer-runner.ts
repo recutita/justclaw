@@ -10,6 +10,10 @@ import type { SessionStore } from "./session-store";
 
 const INITIALIZE_TIMEOUT_MS = 5_000;
 const KILL_TIMEOUT_MS = 1_000;
+// setTimeout clamps any delay above this to 1ms and fires immediately. A cron
+// whose next match is farther out (e.g. "0 0 1 1 *", ~1 year) would otherwise
+// fire in a tight loop, so long delays are split into re-evaluation hops.
+const MAX_TIMEOUT_MS = 2 ** 31 - 1;
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => {
@@ -27,7 +31,7 @@ function sleep(ms: number): Promise<void> {
  * daemons, so the core owns the schedule and spawns the module subprocess on
  * each tick.
  */
-function registerInProcessCron(
+export function registerInProcessCron(
 	cronExpression: string,
 	onFire: () => void,
 ): { stop(): void } {
@@ -45,14 +49,29 @@ function registerInProcessCron(
 			);
 			return;
 		}
-		const delay = Math.max(0, next.getTime() - Date.now());
-		handle = setTimeout(() => {
-			if (stopped) {
-				return;
-			}
-			onFire();
-			scheduleFrom(next.getTime());
-		}, delay);
+		const delay = next.getTime() - Date.now();
+		if (delay > MAX_TIMEOUT_MS) {
+			// Too far out to arm directly. Sleep the max safe span, then recompute
+			// against the wall clock without firing, so the tick lands on time
+			// instead of storming at the clamped 1ms delay.
+			handle = setTimeout(() => {
+				scheduleFrom(Date.now());
+			}, MAX_TIMEOUT_MS);
+			return;
+		}
+		handle = setTimeout(
+			() => {
+				if (stopped) {
+					return;
+				}
+				onFire();
+				// Recompute from the current wall clock, not next.getTime(): timer
+				// modules are idempotent, so a late wake collapses missed ticks to a
+				// single fire here instead of replaying the backlog with delay 0.
+				scheduleFrom(Date.now());
+			},
+			Math.max(0, delay),
+		);
 	}
 
 	scheduleFrom(Date.now());
@@ -85,6 +104,7 @@ function createTimerModulePeer(
 	process: Bun.Subprocess<"pipe", "pipe", "pipe">,
 	queue: EventQueue,
 	sessionStore: SessionStore,
+	characterDir?: string,
 ): JsonRpcPeer {
 	return new JsonRpcPeer({
 		name: manifest.name,
@@ -105,7 +125,16 @@ function createTimerModulePeer(
 				`[${manifest.name}] ignoring unsupported notification ${message.method}`,
 			);
 		},
-		onRequest: createSessionRequestHandler(manifest.name, queue, sessionStore),
+		// characterDir wires INIT.md injection on sessions.switch.v1 for empty
+		// sessions, the same as daemons. daemonsRef is not threaded here: a timer
+		// has no reachable daemon list, so interrupt-overwrite event.dropped.v1
+		// notifications stay unsent for timer-initiated sessions.
+		onRequest: createSessionRequestHandler(
+			manifest.name,
+			queue,
+			sessionStore,
+			characterDir,
+		),
 	});
 }
 
@@ -122,9 +151,33 @@ async function runTimerLifecycle(
 	sessionStore: SessionStore,
 	state: { process: Bun.Subprocess<"pipe", "pipe", "pipe"> | null },
 	initializeTimeoutMs: number,
+	characterDir?: string,
 ): Promise<void> {
-	const peer = createTimerModulePeer(manifest, proc, queue, sessionStore);
-	const stdoutTask = consumeLines(proc.stdout, (line) => peer.handleLine(line));
+	const peer = createTimerModulePeer(
+		manifest,
+		proc,
+		queue,
+		sessionStore,
+		characterDir,
+	);
+	const stdoutTask = consumeLines(proc.stdout, (line) => {
+		// A single malformed line (invalid JSON, bad envelope) must never tear
+		// down the stream: handleLine throws on such lines, and an unhandled
+		// rejection from consumeLines would crash the core before the finally
+		// block below can await it. Log and keep consuming subsequent lines.
+		try {
+			peer.handleLine(line);
+		} catch (error) {
+			console.error(
+				`[${manifest.name}] ignoring malformed line: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	});
+	// Attach a handler immediately so a stream-level rejection (distinct from
+	// the per-line throw already caught above) is never unhandled while the
+	// initialize/exit awaits below are still pending. The finally block awaits
+	// the same task for ordering.
+	stdoutTask.catch(() => {});
 	void consumeLines(proc.stderr, (line) => {
 		console.error(`[${manifest.name}] ${line}`);
 	});
@@ -181,6 +234,7 @@ export async function fireTimer(
 			manifest: TimerModuleManifest,
 		) => Promise<SandboxLaunchSpec>;
 		initializeTimeoutMs?: number;
+		characterDir?: string;
 	},
 ): Promise<void> {
 	const lock = (state.lock ?? Promise.resolve(null)).then(async () => {
@@ -246,6 +300,7 @@ export async function fireTimer(
 		sessionStore,
 		state,
 		initTimeoutMs,
+		options.characterDir,
 	);
 }
 
@@ -260,20 +315,25 @@ export function startTimerSchedulers(
 			manifest: TimerModuleManifest,
 		) => Promise<SandboxLaunchSpec>;
 		initializeTimeoutMs?: number;
+		characterDir?: string;
 	} = {},
 ): TimerScheduler {
 	if (manifests.length === 0) {
 		return { async stop() {} };
 	}
 
-	const states: { process: Bun.Subprocess<"pipe", "pipe", "pipe"> | null }[] =
-		[];
+	// `lock` is set by fireTimer to its kill-previous -> spawn -> record chain;
+	// stop() awaits it so a tick still inside that section cannot spawn a
+	// process after shutdown.
+	type TimerState = {
+		process: Bun.Subprocess<"pipe", "pipe", "pipe"> | null;
+		lock?: Promise<Bun.Subprocess<"pipe", "pipe", "pipe"> | null>;
+	};
+	const states: TimerState[] = [];
 	const cronJobs: { stop(): void }[] = [];
 
 	for (const manifest of manifests) {
-		const state: {
-			process: Bun.Subprocess<"pipe", "pipe", "pipe"> | null;
-		} = { process: null };
+		const state: TimerState = { process: null };
 		states.push(state);
 		cronJobs.push(
 			registerInProcessCron(manifest.cron, () => {
@@ -288,9 +348,18 @@ export function startTimerSchedulers(
 				job.stop();
 			}
 			await Promise.all(
-				states.map((state) => {
+				states.map(async (state) => {
+					// Wait for any in-flight fireTimer critical section to settle
+					// first. Otherwise a tick that already began spawning (state.process
+					// still null while its sandboxFactory awaits) would be read as
+					// "nothing to kill" and leak a process spawned after stop().
+					if (state.lock !== undefined) {
+						await state.lock.catch(() => {});
+					}
 					const proc = state.process;
-					return proc !== null ? killProcess(proc) : Promise.resolve();
+					if (proc !== null) {
+						await killProcess(proc);
+					}
 				}),
 			);
 		},

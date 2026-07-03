@@ -381,6 +381,12 @@ Response:
 { "jsonrpc": "2.0", "id": 7, "result": "ok" }
 ```
 
+### Session lifetime and memory
+
+The core does not bound a session's history by size, age, or token count. A session's history file grows for as long as it stays active; nothing in the core truncates, summarizes, or expires it. Session history therefore has finite practical life even though the core places no limit on it — at some point it grows too large to keep using without external action.
+
+Capping and compacting history is deliberately left as agent policy, not core mechanism. The core's contribution is two primitives: sessions (`sessions.new.v1`, `sessions.switch.v1`) and `MEMORY.md`, a character-directory file re-read from disk before every turn (see [Character files](#character-files)). The expected operating model built on top of those primitives: the agent summarizes durable facts (user preferences, ongoing project state, anything worth keeping beyond the current conversation) into `MEMORY.md`, or hands them to a dedicated module for storage, since both persist independently of any one session's history. When a session's history has grown large enough to warrant a reset, the agent starts a new session with `sessions.new.v1` and activates it with `sessions.switch.v1`, rather than continuing to grow the old session indefinitely.
+
 ## Lifecycle (daemon)
 
 ```
@@ -648,6 +654,8 @@ That includes at least:
 - **Restart recovery:** the previous process exited while one or more events were still marked `running` in the queue (the LLM cycle had started but never finished).
 - **LLM failure:** the runner throws or otherwise fails after the event was consumed and before the cycle would have completed successfully.
 - **No adoptable session:** a session store is configured, the event was consumed from the queue, but no session could be adopted (no readable UUID `{id}.json` files on disk yet and no `sessions.switch.v1` applied before this event in the loop).
+
+**Delivery guarantee: at-least-once, not exactly-once.** `event.dropped.v1` is a best-effort signal that the LLM cycle *may* not have completed normally — it is not proof that it didn't. Restart recovery in particular cannot distinguish "the process exited before the cycle finished" from "the process exited after the cycle finished but before the queue row was marked complete": the row stays `running` until the core finishes marking it complete, and a crash in that narrow window leaves the row `running` on disk even though the cycle already ran to completion (for example, a reply was already delivered). Stale-row recovery on the next start has no way to tell the two cases apart, so it sends `event.dropped.v1` either way. A module that reacts by re-emitting the event can therefore cause it to be processed twice. Modules for which that matters must dedupe on re-emit — for example, by attaching an idempotency key to the event and having whatever consumes a redelivery (the module itself, or a downstream system) ignore a repeat of the same key.
 
 In all cases the notification shape is the same.
 

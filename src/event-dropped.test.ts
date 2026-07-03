@@ -55,4 +55,42 @@ describe("notifyEventDropped", () => {
 			console.error = orig;
 		}
 	});
+
+	test("logs when the source daemon's peer is closed instead of swallowing the notification", () => {
+		const recorded: { method: string; params: unknown }[] = [];
+		const daemons = [
+			{
+				manifest: { name: "m1" },
+				// Simulates a daemon whose peer.close() already ran (e.g. mid-restart
+				// after an unexpected exit): notify() would be a silent no-op here.
+				state: "failed",
+				peer: {
+					notify: (method: string, params: unknown) => {
+						recorded.push({ method, params });
+					},
+				},
+			},
+		];
+
+		const orig = console.error;
+		const lines: string[] = [];
+		console.error = (...args: unknown[]) => {
+			lines.push(args.map(String).join(" "));
+		};
+
+		try {
+			const id = Bun.randomUUIDv7();
+			notifyEventDropped(daemons, {
+				id,
+				source: "m1",
+				params: { type: "event.v1" },
+			});
+
+			expect(recorded).toEqual([]);
+			expect(lines.some((line) => line.includes("event lost"))).toBe(true);
+			expect(lines.some((line) => line.includes("m1"))).toBe(true);
+		} finally {
+			console.error = orig;
+		}
+	});
 });

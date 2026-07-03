@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -13,7 +13,7 @@ import {
 	runLlmLoop,
 	sanitizeHistoryForStorage,
 } from "./llm-loop";
-import type { StartedDaemon } from "./runtime";
+import { type StartedDaemon, stopDaemons } from "./runtime";
 import { buildRuntimeInstructions } from "./runtime-prompt";
 import { SessionStore } from "./session-store";
 
@@ -331,6 +331,7 @@ describe("runLlmLoop", () => {
 		queue.close();
 		await loopTask;
 
+		console.error("DROPPEDDBG", JSON.stringify(dropped));
 		expect(dropped.length).toBe(1);
 		expect((dropped[0] as { type?: string }).type).toBe("event.dropped.v1");
 	});
@@ -1566,4 +1567,379 @@ describe("runLlmLoop", () => {
 		expect(payload.params).toEqual(params);
 		expect(payload.timestamp).toBe(timestampFromUUIDv7(row.id));
 	});
+
+	test("drops an event with an invalid XML key instead of killing the loop", async () => {
+		const home = await createTempDir("justclaw-llm-badkey-");
+		const dbPath = path.join(home, "events.db");
+		const queue = new EventQueue(dbPath);
+		// A leading-digit key is rejected by eventToXml; before the fix this threw
+		// out of runLlmLoop before the per-event try block.
+		queue.enqueue("srcmod", { type: "event.v1", "1bad": "x" });
+
+		const recorded: { method: string; params: unknown }[] = [];
+		const daemons = [
+			{
+				manifest: { name: "srcmod" },
+				tools: [],
+				peer: {
+					notify: (method: string, p: unknown) => {
+						recorded.push({ method, params: p });
+					},
+					request: async () => ({}),
+				},
+			},
+		] as unknown as StartedDaemon[];
+
+		let runnerCallCount = 0;
+		const mockRunner = {
+			run: async () => {
+				runnerCallCount++;
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: daemons }, "test-model", {
+			runner: mockRunner,
+		});
+
+		// The queued event is dropped and its row completed.
+		await waitForQueueEmpty(dbPath);
+		for (let i = 0; i < 50 && recorded.length < 1; i += 1) {
+			await delay(10);
+		}
+
+		// An interrupt with an invalid key is dropped the same way.
+		queue.setInterrupt("srcmod", { type: "event.v1", "2bad": "y" });
+		for (let i = 0; i < 50 && recorded.length < 2; i += 1) {
+			await delay(10);
+		}
+
+		queue.close();
+		// The loop must resolve normally, not reject.
+		await loopTask;
+
+		expect(runnerCallCount).toBe(0);
+		expect(recorded).toHaveLength(2);
+		expect((recorded[0]?.params as { type?: string }).type).toBe(
+			"event.dropped.v1",
+		);
+		expect((recorded[1]?.params as { type?: string }).type).toBe(
+			"event.dropped.v1",
+		);
+	});
+
+	test("aborts a hung module tool request so the run unwinds", async () => {
+		const home = await createTempDir("justclaw-llm-hang-");
+		const dbPath = path.join(home, "events.db");
+		const queue = new EventQueue(dbPath);
+		queue.enqueue("hangmod", { type: "event.v1", kind: "test" });
+
+		const dropped: unknown[] = [];
+		const daemons = [
+			{
+				manifest: { name: "hangmod", replyable: true },
+				tools: [
+					{
+						name: "wait",
+						parameters: { type: "object", properties: {} },
+					},
+				],
+				peer: {
+					// Never resolves: simulates a hung-but-alive module tool.
+					request: () => new Promise(() => {}),
+					notify: (method: string, params: unknown) => {
+						if (method === "event") dropped.push(params);
+					},
+				},
+			},
+		] as unknown as StartedDaemon[];
+
+		const abort = new AbortController();
+		const rc = new RunContext();
+		let toolInvoked = false;
+		const mockRunner = {
+			run: async (
+				agent: Agent,
+				_input: unknown,
+				opts: { signal?: AbortSignal },
+			) => {
+				toolInvoked = true;
+				// Without the abort race this invoke never resolves (the module tool
+				// request hangs), so runner.run would block forever. With it, the
+				// invoke unblocks when the signal fires, letting the run observe the
+				// abort — modeled here the way the SDK aborts a run on its signal.
+				await findFunctionTool(agent, "hangmod__wait").invoke(rc, "{}", {
+					signal: opts.signal,
+				});
+				if (opts.signal?.aborted) {
+					throw new Error("run aborted");
+				}
+				return { finalOutput: "unreachable", history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: daemons }, "test-model", {
+			runner: mockRunner,
+			abortSignal: abort.signal,
+		});
+
+		await waitUntil(() => toolInvoked);
+		abort.abort();
+		// Must resolve (not hang) once the abort unwinds the hung tool request.
+		await loopTask;
+
+		const droppedTypes = dropped.map((d) => (d as { type?: string }).type);
+		expect(droppedTypes).toContain("event.dropped.v1");
+		expect(droppedTypes).not.toContain("message.send.v1");
+	});
+
+	test("drops the reply when the run was aborted as it resolved", async () => {
+		const home = await createTempDir("justclaw-llm-skip-gate-");
+		const dbPath = path.join(home, "events.db");
+		const queue = new EventQueue(dbPath);
+		queue.enqueue("srcmod", { type: "event.v1", kind: "test" });
+
+		const events: unknown[] = [];
+		const daemons = [
+			{
+				manifest: { name: "srcmod", replyable: true },
+				tools: [],
+				peer: {
+					notify: (method: string, params: unknown) => {
+						if (method === "event") events.push(params);
+					},
+					request: async () => ({}),
+				},
+			},
+		] as unknown as StartedDaemon[];
+
+		const mockRunner = {
+			run: async () => {
+				// sessions.skip.v1 landing just as the run resolves.
+				queue.abortCurrentRun();
+				return { finalOutput: "a reply", history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: daemons }, "test-model", {
+			runner: mockRunner,
+		});
+		await waitForQueueEmpty(dbPath);
+		queue.close();
+		await loopTask;
+
+		const types = events.map((e) => (e as { type?: string }).type);
+		expect(types).toContain("event.dropped.v1");
+		expect(types).not.toContain("message.send.v1");
+	});
+
+	test("rolls back in-memory history when the session save fails", async () => {
+		const home = await createTempDir("justclaw-llm-save-rollback-");
+		const dbPath = path.join(home, "events.db");
+		const active = "01900000-0000-7000-8000-0000000000aa";
+		let saveCalls = 0;
+		const sessionStore = {
+			newestReadableSessionId: () => active,
+			load: async () => [],
+			save: async () => {
+				saveCalls++;
+				if (saveCalls === 1) {
+					throw new Error("save exploded");
+				}
+			},
+		} as unknown as SessionStore;
+
+		const queue = new EventQueue(dbPath);
+		queue.setMeta("active_session_id", active);
+		queue.enqueue("srcmod", { type: "event.v1", kind: "first" });
+		queue.enqueue("srcmod", { type: "event.v1", kind: "second" });
+
+		const capturedInputs: unknown[] = [];
+		let runCount = 0;
+		const mockRunner = {
+			run: async (_agent: unknown, input: unknown) => {
+				runCount++;
+				capturedInputs.push(input);
+				if (runCount === 1) {
+					return {
+						finalOutput: null,
+						history: [{ role: "user", content: "turn1" } as AgentInputItem],
+					};
+				}
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
+			runner: mockRunner,
+			sessionStore,
+		});
+		await waitUntil(() => runCount >= 2);
+		queue.close();
+		await loopTask;
+
+		// The second event must not carry the first turn, whose save failed.
+		expect(JSON.stringify(capturedInputs[1])).not.toContain("turn1");
+	});
+
+	test("does not recreate a session deleted mid-run before metadata clears", async () => {
+		const home = await createTempDir("justclaw-llm-delete-race-");
+		const dbPath = path.join(home, "events.db");
+		const historyPath = path.join(home, "history");
+		const sessionStore = new SessionStore(historyPath);
+		const activeId = "01900000-0000-7000-8000-0000000000aa";
+		const sessionFilePath = path.join(historyPath, `${activeId}.json`);
+		await sessionStore.save(activeId, []);
+		const queue = new EventQueue(dbPath);
+		queue.setMeta("active_session_id", activeId);
+		queue.enqueue("srcmod", { type: "event.v1", kind: "test" });
+
+		const mockRunner = {
+			run: async () => {
+				// Model the delete handler's window: the file is removed first,
+				// before active_session_id metadata is cleared.
+				await sessionStore.delete(activeId);
+				return {
+					finalOutput: null,
+					history: [
+						{
+							role: "assistant",
+							content: "reply",
+						} as unknown as AgentInputItem,
+					],
+				};
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
+			runner: mockRunner,
+			sessionStore,
+		});
+		await waitForQueueEmpty(dbPath);
+		queue.close();
+		await loopTask;
+
+		expect(await Bun.file(sessionFilePath).exists()).toBe(false);
+	});
+
+	test("restart_modules keeps character INIT injection for new sessions", async () => {
+		const home = await createTempDir("justclaw-llm-restart-init-");
+		const modulesRoot = path.join(home, "modules");
+		const moduleDir = path.join(modulesRoot, "echomod");
+		await mkdir(moduleDir, { recursive: true });
+		await writeFile(
+			path.join(moduleDir, "module.json"),
+			JSON.stringify({ name: "echomod", exec: "./module.ts", mode: "daemon" }),
+		);
+		// On first initialize the module creates a new session and switches to
+		// it. The core's session-request handler injects INIT.md only when it was
+		// started with characterDir, which restart_modules must forward.
+		const moduleScript = `#!/usr/bin/env bun
+const pending = new Map();
+let nextId = 100;
+function sendRequest(method, params) {
+  const id = nextId++;
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\\n");
+  return new Promise((res, rej) => pending.set(id, { res, rej }));
+}
+let initialized = false;
+const chunks = [];
+for await (const chunk of Bun.stdin.stream()) {
+  chunks.push(chunk);
+  const text = Buffer.concat(chunks).toString("utf8");
+  const lines = text.split(/\\r?\\n/);
+  while (lines.length > 1) {
+    const line = lines.shift();
+    if (!line) continue;
+    const msg = JSON.parse(line);
+    if ("method" in msg) {
+      if (msg.method === "initialize") {
+        process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { tools: [] } }) + "\\n");
+        if (!initialized) {
+          initialized = true;
+          (async () => {
+            const created = await sendRequest("sessions", { type: "sessions.new.v1" });
+            await sendRequest("sessions", { type: "sessions.switch.v1", id: created.id });
+          })();
+        }
+      } else if (msg.method === "shutdown") {
+        process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: "ok" }) + "\\n");
+        process.exit(0);
+      }
+    } else {
+      const h = pending.get(msg.id);
+      if (h) { pending.delete(msg.id); "error" in msg ? h.rej(new Error(msg.error.message)) : h.res(msg.result); }
+    }
+  }
+  chunks.length = 0;
+  if (lines[0]) chunks.push(Buffer.from(lines[0]));
+}
+`;
+		const execPath = path.join(moduleDir, "module.ts");
+		await writeFile(execPath, moduleScript);
+		await chmod(execPath, 0o755);
+
+		const characterDir = path.join(home, "character");
+		await mkdir(characterDir, { recursive: true });
+		const initMarker = "INIT_MARKER_TEXT";
+		await writeFile(path.join(characterDir, "INIT.md"), initMarker);
+
+		const sessionStore = new SessionStore(path.join(home, "history"));
+		// A non-empty active session, so the loop's own bootstrap INIT injection
+		// (which fires only for an empty adopted session) stays quiet. The only
+		// remaining INIT source is the reloaded module's sessions.switch.v1
+		// handler, which needs characterDir forwarded through restart_modules.
+		const primedSession = "01900000-0000-7000-8000-0000000000aa";
+		await sessionStore.save(primedSession, [
+			{ role: "user", content: "primed" } as AgentInputItem,
+		]);
+		const queue = new EventQueue(path.join(home, "events.db"));
+		queue.setMeta("active_session_id", primedSession);
+		queue.enqueue("kicker", { type: "event.v1", kind: "kick" });
+
+		const daemonsRef = { current: [] as StartedDaemon[] };
+		const rc = new RunContext();
+		const capturedInputs: string[] = [];
+		let runCount = 0;
+		const mockRunner = {
+			run: async (agent: Agent, input: unknown) => {
+				runCount += 1;
+				if (runCount === 1) {
+					await findFunctionTool(agent, "restart_modules").invoke(
+						rc,
+						JSON.stringify({ continuation: "" }),
+					);
+				} else {
+					capturedInputs.push(JSON.stringify(input));
+				}
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, daemonsRef, "test-model", {
+			runner: mockRunner,
+			sessionStore,
+			modulesRoot,
+			characterDir,
+			sandboxFactory: async (manifest) => ({
+				backend: "sandbox-exec" as const,
+				cmd: [manifest.execPath],
+				cwd: manifest.moduleDir,
+				env: process.env,
+			}),
+		});
+
+		try {
+			await waitUntil(
+				() => capturedInputs.some((i) => i.includes(initMarker)),
+				15000,
+			);
+		} finally {
+			queue.close();
+			await loopTask;
+			await stopDaemons(daemonsRef.current);
+		}
+
+		expect(capturedInputs.some((i) => i.includes(initMarker))).toBe(true);
+	}, 20000);
 });

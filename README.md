@@ -95,6 +95,8 @@ The core runs a single LLM inference queue. Modules communicate with the core ov
 - **Identity** — Agent personality and instructions loaded from the character directory
 - **Built-in tools** — `shell`, `create_file`, `edit_file`, `delete_file`, `route_message`, `attach_image`, `attach_file`, `restart_modules`, `turn_end`
 
+Session history is not bounded by the core, so it has finite practical life. Long-term memory must be externalized — to `MEMORY.md` in the character directory or a dedicated module — and a session that has grown large should be retired with `sessions.new.v1` / `sessions.switch.v1` rather than grown indefinitely. See [Session lifetime and memory](docs/spec.md#session-lifetime-and-memory).
+
 ### Message routing
 
 The canonical delivery target is the source of the most recently consumed message from a replyable module. The core persists this as `last_replyable_target` so that events from non-replyable sources (for example, a timer module) still route LLM output to the last replyable module.

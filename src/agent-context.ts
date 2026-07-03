@@ -90,15 +90,24 @@ export async function loadHomeAgentsFile(homeDir: string): Promise<string> {
  * unambiguously so file content cannot impersonate a sibling section or the
  * surrounding runtime instructions. Sections are joined with a blank line.
  * Missing files are silently skipped; other read errors propagate.
+ * Reads text() directly rather than checking exists() first: a file removed
+ * between the check and the read would otherwise throw ENOENT and crash the
+ * whole core (uncaught per-event), instead of just being treated as absent.
  */
 export async function loadAgentContext(characterDir: string): Promise<string> {
 	const sections: string[] = [];
 	for (const filename of CHARACTER_FILES) {
 		const file = Bun.file(path.join(characterDir, filename));
-		if (!(await file.exists())) {
-			continue;
+		let content: string;
+		try {
+			content = await file.text();
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+				continue;
+			}
+			throw err;
 		}
-		const trimmed = (await file.text()).trim();
+		const trimmed = content.trim();
 		if (trimmed) {
 			sections.push(`<${filename}>\n${trimmed}\n</${filename}>`);
 		}
