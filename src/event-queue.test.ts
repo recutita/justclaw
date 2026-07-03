@@ -172,11 +172,52 @@ describe("EventQueue", () => {
 		await expect(pending).resolves.toBeUndefined();
 	});
 
-	test("enqueue after close is silently dropped", async () => {
+	test("enqueue after close does not throw and logs the loss", async () => {
 		const homeDir = await createTempDir("jq-drop-");
 		const queue = new EventQueue(path.join(homeDir, "events.db"));
 		queue.close();
-		expect(() => queue.enqueue("s", { type: "event.v1" })).not.toThrow();
+
+		const orig = console.error;
+		const lines: string[] = [];
+		console.error = (...args: unknown[]) => {
+			lines.push(args.map(String).join(" "));
+		};
+
+		try {
+			expect(() => queue.enqueue("s", { type: "event.v1" })).not.toThrow();
+			expect(
+				lines.some(
+					(line) => line.includes("event lost") && line.includes("source=s"),
+				),
+			).toBe(true);
+		} finally {
+			console.error = orig;
+		}
+	});
+
+	test("setInterrupt after close does not strand the slot silently", async () => {
+		const homeDir = await createTempDir("jq-interrupt-closed-");
+		const queue = new EventQueue(path.join(homeDir, "events.db"));
+		queue.close();
+
+		const orig = console.error;
+		const lines: string[] = [];
+		console.error = (...args: unknown[]) => {
+			lines.push(args.map(String).join(" "));
+		};
+
+		try {
+			const result = queue.setInterrupt("s", { type: "event.v1" });
+			expect(result).toBeNull();
+			expect(
+				lines.some(
+					(line) =>
+						line.includes("interrupt lost") && line.includes("source=s"),
+				),
+			).toBe(true);
+		} finally {
+			console.error = orig;
+		}
 	});
 
 	test("next on empty closed queue returns undefined", async () => {

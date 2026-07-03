@@ -76,6 +76,11 @@ export class EventQueue {
 
 	enqueue(source: string, params: Record<string, unknown>): void {
 		if (this.#closed) {
+			// Nothing will ever call next() again once the queue is closed, so
+			// this event can never be delivered. Log the loss instead of a
+			// silent discard (matches the "log the loss" convention used
+			// elsewhere, e.g. notifyDropped's missing-daemon case).
+			console.error(`[core] event lost: source=${source} (queue closed)`);
 			return;
 		}
 
@@ -182,6 +187,20 @@ export class EventQueue {
 		source: string,
 		params: Record<string, unknown>,
 	): InterruptSlot | null {
+		if (this.#closed) {
+			// The loop's next() has already returned undefined for good, so no
+			// future consumeInterrupt() call will ever pick this slot up. Log
+			// both the new interrupt and any previously set one instead of
+			// stranding them silently.
+			console.error(`[core] interrupt lost: source=${source} (queue closed)`);
+			if (this.#interrupt) {
+				console.error(
+					`[core] interrupt lost: source=${this.#interrupt.source} (queue closed)`,
+				);
+			}
+			return null;
+		}
+
 		const previous = this.#interrupt;
 		this.#interrupt = { source, params };
 		// If the loop is parked in next() on an empty queue, wake it so the
