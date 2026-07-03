@@ -649,6 +649,8 @@ That includes at least:
 - **LLM failure:** the runner throws or otherwise fails after the event was consumed and before the cycle would have completed successfully.
 - **No adoptable session:** a session store is configured, the event was consumed from the queue, but no session could be adopted (no readable UUID `{id}.json` files on disk yet and no `sessions.switch.v1` applied before this event in the loop).
 
+**Delivery guarantee: at-least-once, not exactly-once.** `event.dropped.v1` is a best-effort signal that the LLM cycle *may* not have completed normally — it is not proof that it didn't. Restart recovery in particular cannot distinguish "the process exited before the cycle finished" from "the process exited after the cycle finished but before the queue row was marked complete": the row stays `running` until the core finishes marking it complete, and a crash in that narrow window leaves the row `running` on disk even though the cycle already ran to completion (for example, a reply was already delivered). Stale-row recovery on the next start has no way to tell the two cases apart, so it sends `event.dropped.v1` either way. A module that reacts by re-emitting the event can therefore cause it to be processed twice. Modules for which that matters must dedupe on re-emit — for example, by attaching an idempotency key to the event and having whatever consumes a redelivery (the module itself, or a downstream system) ignore a repeat of the same key.
+
 In all cases the notification shape is the same.
 
 ```json
