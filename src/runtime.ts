@@ -812,7 +812,10 @@ export async function reloadModules(
 			timerManifests,
 			eventQueue,
 			options.sessionStore,
-			{ initializeTimeoutMs: options.initializeTimeoutMs },
+			{
+				initializeTimeoutMs: options.initializeTimeoutMs,
+				characterDir: options.characterDir,
+			},
 		);
 		console.error(
 			`[core] reloaded: ${daemonsRef.current.length} daemon(s), ${timerManifests.length} timer(s)`,
@@ -871,6 +874,7 @@ export async function bootstrapRuntime(
 			timerManifests,
 			eventQueue,
 			options.sessionStore,
+			{ characterDir: options.characterDir },
 		);
 		console.error(
 			`[core] started: ${startupRef.current.length} daemon(s), ${timerManifests.length} timer(s)`,
