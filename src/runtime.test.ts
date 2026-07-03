@@ -2264,6 +2264,138 @@ for await (const chunk of Bun.stdin.stream()) {
 		expect(await readFile(startCountPath, "utf8")).toBe("1");
 	});
 
+	test("keeps a successful restart when another daemon's failure splices the registry concurrently", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const fastStartCountPath = path.join(homeDir, "fast-starts.txt");
+		const slowStartCountPath = path.join(homeDir, "slow-starts.txt");
+		const fastTriggerPrefix = path.join(homeDir, "fast-trigger");
+		const slowTriggerPrefix = path.join(homeDir, "slow-trigger");
+
+		function crashOnTriggerScript(
+			startCountPath: string,
+			triggerPrefix: string,
+		): string {
+			return `#!/usr/bin/env bun
+const startCountPath = ${JSON.stringify(startCountPath)};
+const triggerPrefix = ${JSON.stringify(triggerPrefix)};
+let starts = 0;
+try {
+	starts = Number(await Bun.file(startCountPath).text());
+} catch {}
+starts += 1;
+await Bun.write(startCountPath, String(starts));
+for await (const chunk of Bun.stdin.stream()) {
+	const message = JSON.parse(Buffer.from(chunk).toString("utf8").trim());
+	if (message.method === "initialize") {
+		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { tools: [] } }));
+		const triggerPath = \`\${triggerPrefix}-\${starts}\`;
+		while (!(await Bun.file(triggerPath).exists())) {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		process.exit(1);
+	} else if (message.method === "shutdown") {
+		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: "ok" }));
+		process.exit(0);
+	}
+}
+`;
+		}
+
+		// Named so discovery order (alphabetical, like the "a-good"/"z-bad" case
+		// above) puts a-fast before b-slow in daemons.
+		await writeDaemonModule(
+			homeDir,
+			"a-fast",
+			crashOnTriggerScript(fastStartCountPath, fastTriggerPrefix),
+		);
+		await writeDaemonModule(
+			homeDir,
+			"b-slow",
+			crashOnTriggerScript(slowStartCountPath, slowTriggerPrefix),
+		);
+
+		// Set once b-slow's replacement spawn begins. The sandboxFactory below runs
+		// inside startDaemon(), which restartFailedDaemon() reaches only after its
+		// restart-attempt check. Gating the max-attempts change on this flag keeps
+		// b-slow's own check from racing that change (otherwise lowering the max to
+		// 0 for a-fast can also abort b-slow's restart).
+		let slowReplacementSpawning = false;
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
+			sandboxFactory: async (manifest) => {
+				if (manifest.name === "b-slow") {
+					const startCount = Number(
+						await readFile(slowStartCountPath, "utf8").catch(() => "0"),
+					);
+					if (startCount === 1) {
+						// Widen the race window: delay b-slow's replacement spawn so
+						// a-fast's splice below lands while this startDaemon() call
+						// (and the stale index captured before it) is still in flight.
+						slowReplacementSpawning = true;
+						await delay(300);
+					}
+				}
+				return createUnsandboxedSpec(manifest.moduleDir, manifest.execPath);
+			},
+		});
+		expect(runtime.daemons.map((d) => d.manifest.name)).toEqual([
+			"a-fast",
+			"b-slow",
+		]);
+		const originalSlow = runtime.daemons.find(
+			(d) => d.manifest.name === "b-slow",
+		);
+
+		const originalMaxRestartAttempts =
+			process.env.JUSTCLAW_MAX_RESTART_ATTEMPTS;
+		try {
+			// b-slow fails first; its restart is in flight (spawn delayed above).
+			await writeFile(`${slowTriggerPrefix}-1`, "go");
+			await waitUntil(
+				() =>
+					runtime.daemons.find((d) => d.manifest.name === "b-slow")?.state ===
+					"failed",
+			);
+
+			// Wait until b-slow is actually past its restart-attempt check and into
+			// spawning its replacement before lowering the max, so the change only
+			// affects a-fast.
+			await waitUntil(() => slowReplacementSpawning);
+
+			// a-fast now fails too. Lowering the max to 0 makes this first failure
+			// exceed it immediately, so a-fast is spliced out of daemons
+			// synchronously while b-slow's replacement is still spawning above.
+			process.env.JUSTCLAW_MAX_RESTART_ATTEMPTS = "0";
+			await writeFile(`${fastTriggerPrefix}-1`, "go");
+			await waitUntil(
+				() => !runtime.daemons.some((d) => d.manifest.name === "a-fast"),
+			);
+
+			await waitUntil(() => {
+				const slow = runtime.daemons.find((d) => d.manifest.name === "b-slow");
+				return slow?.state === "running";
+			});
+		} finally {
+			if (originalMaxRestartAttempts === undefined) {
+				delete process.env.JUSTCLAW_MAX_RESTART_ATTEMPTS;
+			} else {
+				process.env.JUSTCLAW_MAX_RESTART_ATTEMPTS = originalMaxRestartAttempts;
+			}
+		}
+
+		// The successful b-slow replacement must survive and no ghost may remain.
+		expect(runtime.daemons).toHaveLength(1);
+		const replacementSlow = runtime.daemons[0];
+		expect(replacementSlow?.manifest.name).toBe("b-slow");
+		expect(replacementSlow?.state).toBe("running");
+		expect(replacementSlow).not.toBe(originalSlow);
+
+		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
+	});
+
 	test("waits for a daemon to exit after a shutdown response", async () => {
 		const homeDir = await createTempDir("justclaw-home-");
 		const cleanupMarker = path.join(homeDir, "shutdown-cleanup.txt");

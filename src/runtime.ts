@@ -646,8 +646,7 @@ async function restartFailedDaemon(
 		return;
 	}
 
-	const daemonIndex = daemons.indexOf(daemon);
-	if (daemonIndex < 0) {
+	if (!daemons.includes(daemon)) {
 		return;
 	}
 
@@ -655,7 +654,14 @@ async function restartFailedDaemon(
 		console.error(
 			`[${daemon.manifest.name}] daemon failed after restart: ${error.message}`,
 		);
-		daemons.splice(daemonIndex, 1);
+		// Re-resolve the index right before mutating: a concurrent failure
+		// elsewhere in daemons can splice entries and shift positions while this
+		// function was awaiting above, so an index captured earlier can point at
+		// the wrong (or a since-shifted) entry by the time we act on it.
+		const idx = daemons.indexOf(daemon);
+		if (idx >= 0) {
+			daemons.splice(idx, 1);
+		}
 		return;
 	}
 
@@ -697,11 +703,15 @@ async function restartFailedDaemon(
 				);
 			},
 		});
-		if (daemon.state !== "failed" || daemons[daemonIndex] !== daemon) {
+		// Re-resolve the index here too: startDaemon() above awaited, giving
+		// concurrent failures room to splice daemons and shift this daemon's
+		// position (or remove it) since we last looked.
+		const idx = daemons.indexOf(daemon);
+		if (daemon.state !== "failed" || idx < 0 || daemons[idx] !== daemon) {
 			await stopDaemon(replacement);
 			return;
 		}
-		daemons[daemonIndex] = replacement;
+		daemons[idx] = replacement;
 		superviseDaemon(replacement, options, daemons, eventQueue);
 		console.error(`[${daemon.manifest.name}] restarted after failure`);
 	} catch (restartError) {
