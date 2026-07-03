@@ -381,6 +381,12 @@ Response:
 { "jsonrpc": "2.0", "id": 7, "result": "ok" }
 ```
 
+### Session lifetime and memory
+
+The core does not bound a session's history by size, age, or token count. A session's history file grows for as long as it stays active; nothing in the core truncates, summarizes, or expires it. Session history therefore has finite practical life even though the core places no limit on it — at some point it grows too large to keep using without external action.
+
+Capping and compacting history is deliberately left as agent policy, not core mechanism. The core's contribution is two primitives: sessions (`sessions.new.v1`, `sessions.switch.v1`) and `MEMORY.md`, a character-directory file re-read from disk before every turn (see [Character files](#character-files)). The expected operating model built on top of those primitives: the agent summarizes durable facts (user preferences, ongoing project state, anything worth keeping beyond the current conversation) into `MEMORY.md`, or hands them to a dedicated module for storage, since both persist independently of any one session's history. When a session's history has grown large enough to warrant a reset, the agent starts a new session with `sessions.new.v1` and activates it with `sessions.switch.v1`, rather than continuing to grow the old session indefinitely.
+
 ## Lifecycle (daemon)
 
 ```
