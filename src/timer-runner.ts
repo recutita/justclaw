@@ -10,6 +10,10 @@ import type { SessionStore } from "./session-store";
 
 const INITIALIZE_TIMEOUT_MS = 5_000;
 const KILL_TIMEOUT_MS = 1_000;
+// setTimeout clamps any delay above this to 1ms and fires immediately. A cron
+// whose next match is farther out (e.g. "0 0 1 1 *", ~1 year) would otherwise
+// fire in a tight loop, so long delays are split into re-evaluation hops.
+const MAX_TIMEOUT_MS = 2 ** 31 - 1;
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => {
@@ -27,7 +31,7 @@ function sleep(ms: number): Promise<void> {
  * daemons, so the core owns the schedule and spawns the module subprocess on
  * each tick.
  */
-function registerInProcessCron(
+export function registerInProcessCron(
 	cronExpression: string,
 	onFire: () => void,
 ): { stop(): void } {
@@ -45,14 +49,29 @@ function registerInProcessCron(
 			);
 			return;
 		}
-		const delay = Math.max(0, next.getTime() - Date.now());
-		handle = setTimeout(() => {
-			if (stopped) {
-				return;
-			}
-			onFire();
-			scheduleFrom(next.getTime());
-		}, delay);
+		const delay = next.getTime() - Date.now();
+		if (delay > MAX_TIMEOUT_MS) {
+			// Too far out to arm directly. Sleep the max safe span, then recompute
+			// against the wall clock without firing, so the tick lands on time
+			// instead of storming at the clamped 1ms delay.
+			handle = setTimeout(() => {
+				scheduleFrom(Date.now());
+			}, MAX_TIMEOUT_MS);
+			return;
+		}
+		handle = setTimeout(
+			() => {
+				if (stopped) {
+					return;
+				}
+				onFire();
+				// Recompute from the current wall clock, not next.getTime(): timer
+				// modules are idempotent, so a late wake collapses missed ticks to a
+				// single fire here instead of replaying the backlog with delay 0.
+				scheduleFrom(Date.now());
+			},
+			Math.max(0, delay),
+		);
 	}
 
 	scheduleFrom(Date.now());

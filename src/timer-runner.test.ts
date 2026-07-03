@@ -10,7 +10,7 @@ import {
 } from "./module-manifest";
 import type { SandboxLaunchSpec } from "./sandbox";
 import { SessionStore } from "./session-store";
-import { fireTimer } from "./timer-runner";
+import { fireTimer, registerInProcessCron } from "./timer-runner";
 
 const tempDirs: string[] = [];
 
@@ -100,6 +100,24 @@ for await (const chunk of Bun.stdin.stream()) {
 }
 `;
 }
+
+describe("registerInProcessCron (F4: long-delay clamp)", () => {
+	test("a yearly cron does not fire in a storm within the clamp window", async () => {
+		// "0 0 1 1 *" (next Jan 1) is always > 2**31-1 ms away, so setTimeout would
+		// clamp the delay to 1ms and fire repeatedly. The clamp path must instead
+		// re-evaluate without firing.
+		let fires = 0;
+		const job = registerInProcessCron("0 0 1 1 *", () => {
+			fires += 1;
+		});
+		try {
+			await delay(300);
+			expect(fires).toBeLessThanOrEqual(1);
+		} finally {
+			job.stop();
+		}
+	});
+});
 
 describe("runTimerLifecycle (F1: malformed line)", () => {
 	test("a non-JSON line does not tear down the stream; the following event still enqueues", async () => {
