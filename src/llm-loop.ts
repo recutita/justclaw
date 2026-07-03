@@ -754,6 +754,32 @@ function wrapWithNotification(
 	};
 }
 
+// Resolve/reject with the module tool request, but reject early if the run's
+// abort signal fires first. A hung-but-alive module has no timeout of its own,
+// so without this a stuck request would stall the single serial queue forever
+// and sessions.skip.v1 could not recover it. Rejecting unwinds runner.run so the
+// normal abort -> event.dropped.v1 path runs.
+function requestWithAbort(
+	request: Promise<unknown>,
+	signal: AbortSignal | undefined,
+): Promise<unknown> {
+	if (!signal) {
+		return request;
+	}
+	return new Promise<unknown>((resolve, reject) => {
+		const onAbort = () =>
+			reject(new Error("run aborted before module tool responded"));
+		if (signal.aborted) {
+			onAbort();
+			return;
+		}
+		signal.addEventListener("abort", onAbort, { once: true });
+		request
+			.then(resolve, reject)
+			.finally(() => signal.removeEventListener("abort", onAbort));
+	});
+}
+
 function buildModuleTools(
 	daemons: StartedDaemon[],
 	delivery: ToolResultDelivery,
@@ -766,10 +792,10 @@ function buildModuleTools(
 				// biome-ignore lint/suspicious/noExplicitAny: avoid @openai/agents-core subpath types for parameters
 				parameters: toolDef.parameters as any,
 				strict: false,
-				execute: async (input: unknown) => {
-					const result = await daemon.peer.request(
-						`tool/${toolDef.name}`,
-						input ?? {},
+				execute: async (input: unknown, _context, details) => {
+					const result = await requestWithAbort(
+						daemon.peer.request(`tool/${toolDef.name}`, input ?? {}),
+						details?.signal,
 					);
 					return prepareToolResultForLlm(result, delivery);
 				},

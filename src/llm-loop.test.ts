@@ -331,6 +331,7 @@ describe("runLlmLoop", () => {
 		queue.close();
 		await loopTask;
 
+		console.error("DROPPEDDBG", JSON.stringify(dropped));
 		expect(dropped.length).toBe(1);
 		expect((dropped[0] as { type?: string }).type).toBe("event.dropped.v1");
 	});
@@ -1625,5 +1626,70 @@ describe("runLlmLoop", () => {
 		expect((recorded[1]?.params as { type?: string }).type).toBe(
 			"event.dropped.v1",
 		);
+	});
+
+	test("aborts a hung module tool request so the run unwinds", async () => {
+		const home = await createTempDir("justclaw-llm-hang-");
+		const dbPath = path.join(home, "events.db");
+		const queue = new EventQueue(dbPath);
+		queue.enqueue("hangmod", { type: "event.v1", kind: "test" });
+
+		const dropped: unknown[] = [];
+		const daemons = [
+			{
+				manifest: { name: "hangmod", replyable: true },
+				tools: [
+					{
+						name: "wait",
+						parameters: { type: "object", properties: {} },
+					},
+				],
+				peer: {
+					// Never resolves: simulates a hung-but-alive module tool.
+					request: () => new Promise(() => {}),
+					notify: (method: string, params: unknown) => {
+						if (method === "event") dropped.push(params);
+					},
+				},
+			},
+		] as unknown as StartedDaemon[];
+
+		const abort = new AbortController();
+		const rc = new RunContext();
+		let toolInvoked = false;
+		const mockRunner = {
+			run: async (
+				agent: Agent,
+				_input: unknown,
+				opts: { signal?: AbortSignal },
+			) => {
+				toolInvoked = true;
+				// Without the abort race this invoke never resolves (the module tool
+				// request hangs), so runner.run would block forever. With it, the
+				// invoke unblocks when the signal fires, letting the run observe the
+				// abort — modeled here the way the SDK aborts a run on its signal.
+				await findFunctionTool(agent, "hangmod__wait").invoke(rc, "{}", {
+					signal: opts.signal,
+				});
+				if (opts.signal?.aborted) {
+					throw new Error("run aborted");
+				}
+				return { finalOutput: "unreachable", history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: daemons }, "test-model", {
+			runner: mockRunner,
+			abortSignal: abort.signal,
+		});
+
+		await waitUntil(() => toolInvoked);
+		abort.abort();
+		// Must resolve (not hang) once the abort unwinds the hung tool request.
+		await loopTask;
+
+		const droppedTypes = dropped.map((d) => (d as { type?: string }).type);
+		expect(droppedTypes).toContain("event.dropped.v1");
+		expect(droppedTypes).not.toContain("message.send.v1");
 	});
 });
