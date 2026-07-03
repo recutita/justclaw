@@ -1593,6 +1593,81 @@ for await (const chunk of Bun.stdin.stream()) {
 		runtime.eventQueue.close();
 	});
 
+	test("restarts instead of removing a daemon that emits an event before failing again", async () => {
+		const homeDir = await createTempDir("justclaw-home-");
+		const startCountPath = path.join(homeDir, "event-then-fail-starts.txt");
+		await writeDaemonModule(
+			homeDir,
+			"event-then-fail",
+			`#!/usr/bin/env bun
+let starts = 0;
+try {
+	starts = Number(await Bun.file(${JSON.stringify(startCountPath)}).text());
+} catch {}
+starts += 1;
+await Bun.write(${JSON.stringify(startCountPath)}, String(starts));
+for await (const chunk of Bun.stdin.stream()) {
+	const message = JSON.parse(Buffer.from(chunk).toString("utf8").trim());
+	if (message.method === "initialize") {
+		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { tools: [] } }));
+		if (starts === 1) {
+			process.exit(1);
+		}
+		if (starts === 2) {
+			console.log(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "event.v1", kind: "proof" } }));
+			// Let the event line flush and be consumed before exiting.
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			process.exit(1);
+		}
+	} else if (message.method === "shutdown") {
+		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: "ok" }));
+		process.exit(0);
+	}
+}
+`,
+		);
+
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			...createSessionContext(homeDir),
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		// First failure (starts === 1) is within the default max (1), so the
+		// daemon restarts and its replacement carries restartAttempts === 1,
+		// already at the max. The replacement emits its event immediately on
+		// start, so the pre-event restartAttempts === 1 is not asserted here: it
+		// is reset to 0 the moment the event is consumed, too fast to observe
+		// deterministically. The third start below is what proves reset-from-max.
+		await waitUntil(async () => {
+			return (
+				(await readFile(startCountPath, "utf8")) === "2" &&
+				runtime.daemons[0]?.state === "running"
+			);
+		});
+
+		const event = await runtime.eventQueue.next();
+		expect(event?.params.kind).toBe("proof");
+
+		// The accepted event reset restartAttempts to 0 before the second
+		// exit(1), so this failure must restart the daemon (a third start)
+		// instead of removing it (which is what the pre-fix lifetime counter
+		// would do at restartAttempts === max).
+		await waitUntil(async () => {
+			return (
+				(await readFile(startCountPath, "utf8")) === "3" &&
+				runtime.daemons[0]?.state === "running"
+			);
+		});
+		expect(runtime.daemons).toHaveLength(1);
+		expect(runtime.daemons[0]?.restartAttempts).toBe(1);
+
+		await stopDaemons(runtime.daemons);
+		runtime.eventQueue.close();
+	});
+
 	test("skips a daemon that exits before initialize responds", async () => {
 		const homeDir = await createTempDir("justclaw-home-");
 		await writeDaemonModule(

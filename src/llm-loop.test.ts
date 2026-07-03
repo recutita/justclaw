@@ -1693,6 +1693,53 @@ describe("runLlmLoop", () => {
 		expect(droppedTypes).not.toContain("message.send.v1");
 	});
 
+	test("resets restartAttempts after a module tool call resolves", async () => {
+		const home = await createTempDir("justclaw-llm-tool-reset-");
+		const dbPath = path.join(home, "events.db");
+		const queue = new EventQueue(dbPath);
+		queue.enqueue("pingmod", { type: "event.v1", kind: "test" });
+
+		const daemon = {
+			manifest: { name: "pingmod", replyable: true },
+			// Preloaded at the max restart attempts: proves the reset (not a
+			// freshly-spawned daemon that happens to already read 0).
+			restartAttempts: 3,
+			tools: [
+				{
+					name: "ping",
+					parameters: { type: "object", properties: {} },
+				},
+			],
+			peer: {
+				request: async () => "pong",
+				notify: () => {},
+			},
+		} as unknown as StartedDaemon;
+		const daemons = [daemon];
+
+		const rc = new RunContext();
+		let toolInvoked = false;
+		const mockRunner = {
+			run: async (agent: Agent) => {
+				toolInvoked = true;
+				await findFunctionTool(agent, "pingmod__ping").invoke(rc, "{}", {});
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: daemons }, "test-model", {
+			runner: mockRunner,
+		});
+
+		await waitUntil(() => toolInvoked);
+		queue.close();
+		await loopTask;
+
+		// A resolved tool call proves the daemon is alive and serving requests,
+		// so it must reset the consecutive-failure count.
+		expect(daemon.restartAttempts).toBe(0);
+	});
+
 	test("drops the reply when the run was aborted as it resolved", async () => {
 		const home = await createTempDir("justclaw-llm-skip-gate-");
 		const dbPath = path.join(home, "events.db");
