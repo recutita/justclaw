@@ -1693,6 +1693,46 @@ describe("runLlmLoop", () => {
 		expect(droppedTypes).not.toContain("message.send.v1");
 	});
 
+	test("drops the reply when the run was aborted as it resolved", async () => {
+		const home = await createTempDir("justclaw-llm-skip-gate-");
+		const dbPath = path.join(home, "events.db");
+		const queue = new EventQueue(dbPath);
+		queue.enqueue("srcmod", { type: "event.v1", kind: "test" });
+
+		const events: unknown[] = [];
+		const daemons = [
+			{
+				manifest: { name: "srcmod", replyable: true },
+				tools: [],
+				peer: {
+					notify: (method: string, params: unknown) => {
+						if (method === "event") events.push(params);
+					},
+					request: async () => ({}),
+				},
+			},
+		] as unknown as StartedDaemon[];
+
+		const mockRunner = {
+			run: async () => {
+				// sessions.skip.v1 landing just as the run resolves.
+				queue.abortCurrentRun();
+				return { finalOutput: "a reply", history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: daemons }, "test-model", {
+			runner: mockRunner,
+		});
+		await waitForQueueEmpty(dbPath);
+		queue.close();
+		await loopTask;
+
+		const types = events.map((e) => (e as { type?: string }).type);
+		expect(types).toContain("event.dropped.v1");
+		expect(types).not.toContain("message.send.v1");
+	});
+
 	test("restart_modules keeps character INIT injection for new sessions", async () => {
 		const home = await createTempDir("justclaw-llm-restart-init-");
 		const modulesRoot = path.join(home, "modules");

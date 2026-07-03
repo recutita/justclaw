@@ -1526,6 +1526,17 @@ export async function runLlmLoop(
 				signal: runController.signal,
 				maxTurns,
 			});
+			// A sessions.skip.v1 that aborted this run — including the narrow window
+			// where the run resolved just before the abort landed — must yield a
+			// dropped event, not a delivered reply. Past this point the run is
+			// committed: the controller is unregistered so a later skip is a no-op
+			// (the save/deliver window is intentionally not abortable).
+			if (runController.signal.aborted) {
+				notifyEventDropped(daemonsRef.current, event);
+				if (!isInterrupt) eventQueue.complete(event.id);
+				continue;
+			}
+			eventQueue.setRunController(null);
 			const text = result.finalOutput;
 			session.history = sanitizeHistoryForStorage(result.history);
 			if (sessionStore && session.currentSessionId !== null) {
