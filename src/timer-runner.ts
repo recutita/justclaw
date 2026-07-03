@@ -104,6 +104,7 @@ function createTimerModulePeer(
 	process: Bun.Subprocess<"pipe", "pipe", "pipe">,
 	queue: EventQueue,
 	sessionStore: SessionStore,
+	characterDir?: string,
 ): JsonRpcPeer {
 	return new JsonRpcPeer({
 		name: manifest.name,
@@ -124,7 +125,16 @@ function createTimerModulePeer(
 				`[${manifest.name}] ignoring unsupported notification ${message.method}`,
 			);
 		},
-		onRequest: createSessionRequestHandler(manifest.name, queue, sessionStore),
+		// characterDir wires INIT.md injection on sessions.switch.v1 for empty
+		// sessions, the same as daemons. daemonsRef is not threaded here: a timer
+		// has no reachable daemon list, so interrupt-overwrite event.dropped.v1
+		// notifications stay unsent for timer-initiated sessions.
+		onRequest: createSessionRequestHandler(
+			manifest.name,
+			queue,
+			sessionStore,
+			characterDir,
+		),
 	});
 }
 
@@ -141,8 +151,15 @@ async function runTimerLifecycle(
 	sessionStore: SessionStore,
 	state: { process: Bun.Subprocess<"pipe", "pipe", "pipe"> | null },
 	initializeTimeoutMs: number,
+	characterDir?: string,
 ): Promise<void> {
-	const peer = createTimerModulePeer(manifest, proc, queue, sessionStore);
+	const peer = createTimerModulePeer(
+		manifest,
+		proc,
+		queue,
+		sessionStore,
+		characterDir,
+	);
 	const stdoutTask = consumeLines(proc.stdout, (line) => {
 		// A single malformed line (invalid JSON, bad envelope) must never tear
 		// down the stream: handleLine throws on such lines, and an unhandled
@@ -217,6 +234,7 @@ export async function fireTimer(
 			manifest: TimerModuleManifest,
 		) => Promise<SandboxLaunchSpec>;
 		initializeTimeoutMs?: number;
+		characterDir?: string;
 	},
 ): Promise<void> {
 	const lock = (state.lock ?? Promise.resolve(null)).then(async () => {
@@ -282,6 +300,7 @@ export async function fireTimer(
 		sessionStore,
 		state,
 		initTimeoutMs,
+		options.characterDir,
 	);
 }
 
@@ -296,6 +315,7 @@ export function startTimerSchedulers(
 			manifest: TimerModuleManifest,
 		) => Promise<SandboxLaunchSpec>;
 		initializeTimeoutMs?: number;
+		characterDir?: string;
 	} = {},
 ): TimerScheduler {
 	if (manifests.length === 0) {

@@ -37,6 +37,30 @@ function createSessionContext(homeDir: string): { sessionStore: SessionStore } {
 	return { sessionStore: new SessionStore(path.join(homeDir, "history")) };
 }
 
+// Drains queued events until one matches `predicate`, completing the rest.
+// Resolves null if nothing matches within the timeout.
+async function waitForEvent(
+	queue: EventQueue,
+	predicate: (event: { params: Record<string, unknown> }) => boolean,
+	timeoutMs = 3000,
+): Promise<{ params: Record<string, unknown> } | null> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		const event = await Promise.race([
+			queue.next(),
+			delay(deadline - Date.now()).then(() => undefined),
+		]);
+		if (!event) {
+			return null;
+		}
+		if (predicate(event)) {
+			return event;
+		}
+		queue.complete(event.id);
+	}
+	return null;
+}
+
 function createUnsandboxedSpec(
 	moduleDir: string,
 	execPath: string,
@@ -110,6 +134,52 @@ for await (const chunk of Bun.stdin.stream()) {
 function createHangingTimerScript(): string {
 	return `#!/usr/bin/env bun
 await new Promise(() => {});
+`;
+}
+
+// Timer module that answers initialize, then creates a session and switches to
+// it (both empty), then exits. Drives the session request handler (F19).
+function createSessionSwitchTimerScript(): string {
+	return `#!/usr/bin/env bun
+const pending = new Map();
+let nextId = 100;
+function sendRequest(method, params) {
+  const id = nextId++;
+  const msg = { jsonrpc: "2.0", id, method };
+  if (params !== undefined) msg.params = params;
+  process.stdout.write(JSON.stringify(msg) + "\\n");
+  return new Promise((resolve, reject) => { pending.set(id, { resolve, reject }); });
+}
+const chunks = [];
+let started = false;
+for await (const chunk of Bun.stdin.stream()) {
+  chunks.push(chunk);
+  const text = Buffer.concat(chunks).toString("utf8");
+  const lines = text.split(/\\r?\\n/);
+  while (lines.length > 1) {
+    const line = lines.shift();
+    if (!line) continue;
+    const msg = JSON.parse(line);
+    if ("method" in msg) {
+      if (msg.method === "initialize") {
+        process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { tools: [] } }) + "\\n");
+        if (!started) {
+          started = true;
+          (async () => {
+            const created = await sendRequest("sessions", { type: "sessions.new.v1" });
+            await sendRequest("sessions", { type: "sessions.switch.v1", id: created.id });
+            process.exit(0);
+          })();
+        }
+      }
+    } else {
+      const h = pending.get(msg.id);
+      if (h) { pending.delete(msg.id); "error" in msg ? h.reject(new Error(msg.error.message)) : h.resolve(msg.result); }
+    }
+  }
+  chunks.length = 0;
+  if (lines[0]) chunks.push(Buffer.from(lines[0]));
+}
 `;
 }
 
@@ -240,6 +310,43 @@ describe("startTimerSchedulers.stop (F18: in-flight fireTimer)", () => {
 			}
 			spawnSpy.mockRestore();
 			parseSpy.mockRestore();
+			queue.close();
+		}
+	});
+});
+
+describe("fireTimer (F19: characterDir INIT injection)", () => {
+	test("a timer's sessions.switch.v1 on an empty session injects INIT.md", async () => {
+		const homeDir = await createTempDir("justclaw-timer-init-");
+		const ctx = createSessionContext(homeDir);
+		const queue = new EventQueue(path.join(homeDir, "events.db"));
+		const characterDir = path.join(homeDir, "character");
+		await mkdir(characterDir, { recursive: true });
+		await writeFile(path.join(characterDir, "INIT.md"), "startup task\n");
+		const manifest = await writeTimerModule(
+			homeDir,
+			"tick",
+			createSessionSwitchTimerScript(),
+		);
+		const state: { process: Bun.Subprocess<"pipe", "pipe", "pipe"> | null } = {
+			process: null,
+		};
+
+		try {
+			await fireTimer(manifest, state, queue, ctx.sessionStore, {
+				sandboxFactory: async (m) =>
+					createUnsandboxedSpec(m.moduleDir, m.execPath),
+				characterDir,
+			});
+
+			// The switch enqueues a sessions.switch.v1 row followed by the INIT
+			// event.v1 only when characterDir is threaded into the session handler.
+			const initEvent = await waitForEvent(
+				queue,
+				(e) => e.params.type === "event.v1" && e.params.text === "startup task",
+			);
+			expect(initEvent).not.toBeNull();
+		} finally {
 			queue.close();
 		}
 	});
