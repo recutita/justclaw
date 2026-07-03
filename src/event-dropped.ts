@@ -4,6 +4,12 @@ import { type QueuedEvent, timestampFromUUIDv7 } from "./event-queue";
 export type EventDropDaemon = {
 	manifest: { name: string };
 	peer: { notify(method: string, params: unknown): void };
+	// Optional lifecycle state (matches runtime.ts's DaemonState). When present
+	// and not "running", the daemon's peer transport has already been closed
+	// (see handleDaemonFailure), so peer.notify would be a silent no-op rather
+	// than an actual delivery. Structurally compatible with the real daemon
+	// records passed in from runtime.ts without importing that module here.
+	state?: string;
 };
 
 // Omit binary data fields from dropped notifications to avoid sending large
@@ -35,7 +41,10 @@ export function notifyDropped(
 	idForLog?: string,
 ): void {
 	const daemon = daemons.find((d) => d.manifest.name === source);
-	if (daemon) {
+	// A daemon with a defined, non-"running" state has already had its peer
+	// closed (e.g. mid-restart after an unexpected exit); notify() on a closed
+	// peer is a silent no-op, so treat it the same as "daemon not found".
+	if (daemon && (daemon.state === undefined || daemon.state === "running")) {
 		daemon.peer.notify("event", {
 			type: "event.dropped.v1",
 			source,
