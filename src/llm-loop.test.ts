@@ -1782,6 +1782,46 @@ describe("runLlmLoop", () => {
 		expect(JSON.stringify(capturedInputs[1])).not.toContain("turn1");
 	});
 
+	test("does not recreate a session deleted mid-run before metadata clears", async () => {
+		const home = await createTempDir("justclaw-llm-delete-race-");
+		const dbPath = path.join(home, "events.db");
+		const historyPath = path.join(home, "history");
+		const sessionStore = new SessionStore(historyPath);
+		const activeId = "01900000-0000-7000-8000-0000000000aa";
+		const sessionFilePath = path.join(historyPath, `${activeId}.json`);
+		await sessionStore.save(activeId, []);
+		const queue = new EventQueue(dbPath);
+		queue.setMeta("active_session_id", activeId);
+		queue.enqueue("srcmod", { type: "event.v1", kind: "test" });
+
+		const mockRunner = {
+			run: async () => {
+				// Model the delete handler's window: the file is removed first,
+				// before active_session_id metadata is cleared.
+				await sessionStore.delete(activeId);
+				return {
+					finalOutput: null,
+					history: [
+						{
+							role: "assistant",
+							content: "reply",
+						} as unknown as AgentInputItem,
+					],
+				};
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
+			runner: mockRunner,
+			sessionStore,
+		});
+		await waitForQueueEmpty(dbPath);
+		queue.close();
+		await loopTask;
+
+		expect(await Bun.file(sessionFilePath).exists()).toBe(false);
+	});
+
 	test("restart_modules keeps character INIT injection for new sessions", async () => {
 		const home = await createTempDir("justclaw-llm-restart-init-");
 		const modulesRoot = path.join(home, "modules");

@@ -1543,7 +1543,19 @@ export async function runLlmLoop(
 			const text = result.finalOutput;
 			session.history = sanitizeHistoryForStorage(result.history);
 			if (sessionStore && session.currentSessionId !== null) {
-				if (await shouldPersistCurrentSession(session, eventQueue)) {
+				// Re-check liveness immediately before writing. sessions.delete.v1
+				// removes the history file mid-run; the completing turn must not
+				// recreate it (spec: deleted sessions are never written again).
+				// active_session_id alone is insufficient because the delete removes
+				// the file before it clears that metadata, so also confirm the file
+				// still exists.
+				const stillActive =
+					session.currentSessionId ===
+					eventQueue.getMeta(ACTIVE_SESSION_META_KEY);
+				const stillOnDisk =
+					stillActive &&
+					(await sessionStore.load(session.currentSessionId)) !== null;
+				if (stillOnDisk) {
 					await sessionStore.save(session.currentSessionId, session.history);
 				} else {
 					resetSessionState(session);
