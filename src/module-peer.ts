@@ -4,7 +4,11 @@ import {
 	notifyDropped,
 	notifyEventDropped,
 } from "./event-dropped";
-import { ACTIVE_SESSION_META_KEY, type EventQueue } from "./event-queue";
+import {
+	ACTIVE_SESSION_META_KEY,
+	type EventQueue,
+	formatLocalTimestamp,
+} from "./event-queue";
 import type { SessionStore } from "./session-store";
 
 export type EventParams = Record<string, unknown> & {
@@ -177,7 +181,7 @@ export function createSessionRequestHandler(
 						daemonsRef.current,
 						previous.source,
 						previous.params,
-						new Date().toISOString(),
+						formatLocalTimestamp(Date.now()),
 					);
 				}
 				return "ok";

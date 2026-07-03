@@ -6,6 +6,7 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import {
 	EventQueue,
+	formatLocalTimestamp,
 	resolveEventQueuePath,
 	timestampFromUUIDv7,
 } from "./event-queue";
@@ -435,5 +436,30 @@ for await (const chunk of Bun.stdin.stream()) {
 		} finally {
 			console.error = originalConsoleError;
 		}
+	});
+});
+
+describe("formatLocalTimestamp", () => {
+	const originalTz = process.env.TZ;
+
+	afterEach(() => {
+		// Reassign (rather than `delete`) to restore: Bun/JSC's local-time cache
+		// does not invalidate correctly across a `delete process.env.TZ`, which
+		// left later tests seeing the first test's zone.
+		process.env.TZ = originalTz;
+	});
+
+	test("renders JST with a positive offset", () => {
+		process.env.TZ = "Asia/Tokyo";
+		const ms = Date.parse("2026-07-03T02:37:00.000Z");
+		expect(formatLocalTimestamp(ms)).toBe("2026-07-03T11:37:00+09:00");
+	});
+
+	test("renders +00:00 (never Z) when TZ is UTC", () => {
+		process.env.TZ = "UTC";
+		const ms = Date.parse("2026-07-03T02:37:00.000Z");
+		const result = formatLocalTimestamp(ms);
+		expect(result).toBe("2026-07-03T02:37:00+00:00");
+		expect(result).not.toContain("Z");
 	});
 });

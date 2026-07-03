@@ -666,7 +666,7 @@ In all cases the notification shape is the same.
   "params": {
     "type": "event.dropped.v1",
     "source": "{module-name}",
-    "timestamp": "2026-04-14T10:00:00.000Z",
+    "timestamp": "2026-04-14T10:00:00+09:00",
     "params": {
       "type": "event.v1",
       "kind": "message.received",
@@ -680,7 +680,7 @@ In all cases the notification shape is the same.
 |---|---|---|
 | `type` | string | Always `event.dropped.v1` |
 | `source` | string | Name of the module that originally emitted the event |
-| `timestamp` | string | ISO 8601, when the event was originally received by the core |
+| `timestamp` | string | Local ISO 8601 with an explicit numeric offset (never `Z`), when the event was originally received by the core |
 | `params` | object | Original event params as emitted by the source module, with one exception (see below) |
 
 For `image.send.v1`, `file.send.v1`, and `audio.send.v1` events, the base64 `data` field is stripped from `params` before the notification is sent; all other fields (`mediaType`, `filename`, `format`, etc.) are preserved. This keeps the core from echoing large binary payloads back through the module channel. The source module already holds the original data and can re-emit it if it chooses.
@@ -885,7 +885,7 @@ Event payloads are arbitrary JSON objects. The canonical text-oriented envelope 
 - Special characters (`<`, `>`, `&`) are XML-escaped
 - Object keys must be valid XML element names (no leading digits, no whitespace, no special characters). Invalid keys are an error.
 
-The core wraps each event with metadata (`source`, `timestamp`) it knows independently of the module.
+The core wraps each event with metadata (`source`, `timestamp`) it knows independently of the module. `timestamp` is local wall-clock time (per the `TZ` environment variable or the system's local zone) with an explicit numeric offset — never `Z`, never a naked local time without an offset — so a reader is never left to infer the zone. Only persistence (`events.db`) stores timestamps in UTC.
 
 **Example:**
 
@@ -908,7 +908,7 @@ Module emits:
 LLM receives:
 
 ```xml
-<event source="{module-name}" timestamp="2026-04-10T10:00:00Z">
+<event source="{module-name}" timestamp="2026-04-10T10:00:00+09:00">
   <kind>message.received</kind>
   <user>alice</user>
   <text>hello</text>

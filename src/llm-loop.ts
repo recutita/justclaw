@@ -22,6 +22,7 @@ import { notifyDropped, notifyEventDropped } from "./event-dropped";
 import {
 	ACTIVE_SESSION_META_KEY,
 	type EventQueue,
+	formatLocalTimestamp,
 	LAST_REPLYABLE_TARGET_META_KEY,
 	type QueuedEvent,
 	timestampFromUUIDv7,
@@ -1603,7 +1604,7 @@ export async function runLlmLoop(
 			daemonsRef.current,
 			pendingInterrupt.source,
 			pendingInterrupt.params,
-			new Date().toISOString(),
+			formatLocalTimestamp(Date.now()),
 		);
 	}
 }
