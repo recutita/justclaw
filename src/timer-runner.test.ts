@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -10,7 +10,11 @@ import {
 } from "./module-manifest";
 import type { SandboxLaunchSpec } from "./sandbox";
 import { SessionStore } from "./session-store";
-import { fireTimer, registerInProcessCron } from "./timer-runner";
+import {
+	fireTimer,
+	registerInProcessCron,
+	startTimerSchedulers,
+} from "./timer-runner";
 
 const tempDirs: string[] = [];
 
@@ -101,6 +105,14 @@ for await (const chunk of Bun.stdin.stream()) {
 `;
 }
 
+// Timer module that never exits and never responds, so it stays alive until
+// the core kills it. Used to observe shutdown killing an in-flight spawn (F18).
+function createHangingTimerScript(): string {
+	return `#!/usr/bin/env bun
+await new Promise(() => {});
+`;
+}
+
 describe("registerInProcessCron (F4: long-delay clamp)", () => {
 	test("a yearly cron does not fire in a storm within the clamp window", async () => {
 		// "0 0 1 1 *" (next Jan 1) is always > 2**31-1 ms away, so setTimeout would
@@ -149,6 +161,85 @@ describe("runTimerLifecycle (F1: malformed line)", () => {
 			expect(event?.params.type).toBe("event.v1");
 			expect(event?.params.text).toBe("after-bad-line");
 		} finally {
+			queue.close();
+		}
+	});
+});
+
+describe("startTimerSchedulers.stop (F18: in-flight fireTimer)", () => {
+	test("awaits an in-flight fireTimer and kills the process spawned during shutdown", async () => {
+		const homeDir = await createTempDir("justclaw-timer-stop-inflight-");
+		const ctx = createSessionContext(homeDir);
+		const queue = new EventQueue(path.join(homeDir, "events.db"));
+		const manifest = await writeTimerModule(
+			homeDir,
+			"tick",
+			createHangingTimerScript(),
+		);
+
+		// Drive the cron to fire ~immediately, and only once: the first parse
+		// returns a near date, later parses push far into the future so no second
+		// tick races the shutdown assertion. Bun.cron is minute-granular, so
+		// without this the tick would be up to a minute away.
+		let firstParse = true;
+		const parseSpy = spyOn(Bun.cron, "parse").mockImplementation(() => {
+			if (firstParse) {
+				firstParse = false;
+				return new Date(Date.now() + 20);
+			}
+			return new Date(Date.now() + 1_000_000);
+		});
+
+		// Observe every spawned subprocess so we can assert it was reaped.
+		const spawnSpy = spyOn(Bun, "spawn");
+
+		// Gate the sandbox factory so stop() runs while fireTimer is mid-flight
+		// (inside the kill-previous -> spawn critical section).
+		let signalEntered: () => void = () => {};
+		const entered = new Promise<void>((resolve) => {
+			signalEntered = resolve;
+		});
+		let releaseGate: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			releaseGate = resolve;
+		});
+		const sandboxFactory = async (m: TimerModuleManifest) => {
+			signalEntered();
+			await gate;
+			return createUnsandboxedSpec(m.moduleDir, m.execPath);
+		};
+
+		const scheduler = startTimerSchedulers(
+			[manifest],
+			queue,
+			ctx.sessionStore,
+			{ sandboxFactory, initializeTimeoutMs: 200 },
+		);
+		try {
+			await entered; // fireTimer is now inside its critical section
+			const stopPromise = scheduler.stop();
+			releaseGate(); // let fireTimer finish spawning after stop() began
+			await stopPromise; // must resolve, not hang or leak
+
+			const procs = spawnSpy.mock.results
+				.filter((r) => r.type === "return")
+				.map((r) => r.value as Bun.Subprocess);
+			expect(procs).toHaveLength(1);
+			// The process spawned during shutdown must have been killed, not leaked.
+			// A signal-killed process reports exitCode null but killed === true;
+			// a leaked one is still running (killed === false).
+			expect(procs[0]?.killed).toBe(true);
+		} finally {
+			for (const r of spawnSpy.mock.results) {
+				if (r.type === "return") {
+					const proc = r.value as Bun.Subprocess;
+					if (!proc.killed && proc.exitCode === null) {
+						proc.kill("SIGKILL");
+					}
+				}
+			}
+			spawnSpy.mockRestore();
+			parseSpy.mockRestore();
 			queue.close();
 		}
 	});

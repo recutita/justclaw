@@ -302,14 +302,18 @@ export function startTimerSchedulers(
 		return { async stop() {} };
 	}
 
-	const states: { process: Bun.Subprocess<"pipe", "pipe", "pipe"> | null }[] =
-		[];
+	// `lock` is set by fireTimer to its kill-previous -> spawn -> record chain;
+	// stop() awaits it so a tick still inside that section cannot spawn a
+	// process after shutdown.
+	type TimerState = {
+		process: Bun.Subprocess<"pipe", "pipe", "pipe"> | null;
+		lock?: Promise<Bun.Subprocess<"pipe", "pipe", "pipe"> | null>;
+	};
+	const states: TimerState[] = [];
 	const cronJobs: { stop(): void }[] = [];
 
 	for (const manifest of manifests) {
-		const state: {
-			process: Bun.Subprocess<"pipe", "pipe", "pipe"> | null;
-		} = { process: null };
+		const state: TimerState = { process: null };
 		states.push(state);
 		cronJobs.push(
 			registerInProcessCron(manifest.cron, () => {
@@ -324,9 +328,18 @@ export function startTimerSchedulers(
 				job.stop();
 			}
 			await Promise.all(
-				states.map((state) => {
+				states.map(async (state) => {
+					// Wait for any in-flight fireTimer critical section to settle
+					// first. Otherwise a tick that already began spawning (state.process
+					// still null while its sandboxFactory awaits) would be read as
+					// "nothing to kill" and leak a process spawned after stop().
+					if (state.lock !== undefined) {
+						await state.lock.catch(() => {});
+					}
 					const proc = state.process;
-					return proc !== null ? killProcess(proc) : Promise.resolve();
+					if (proc !== null) {
+						await killProcess(proc);
+					}
 				}),
 			);
 		},
