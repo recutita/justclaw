@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import type { DaemonModuleManifest } from "./module-manifest";
 import {
 	createDarwinWorkspaceSandboxProfile,
+	createLinuxBubblewrapCommand,
 	createLinuxWorkspaceBwrapCommand,
 	createWorkspaceSandboxBaseCommand,
 } from "./sandbox";
@@ -167,6 +169,86 @@ describe("workspace sandbox profiles", () => {
 		expect(spec.cmdPrefix[0]).toBe("/usr/bin/sandbox-exec");
 		expect(spec.cmdPrefix[1]).toBe("-p");
 		expect(spec.cmdPrefix[spec.cmdPrefix.length - 1]).toBe("--");
+	});
+
+	test("operator RW path nested under a standard RO root still gets a --bind, with a warning (module sandbox)", async () => {
+		const manifest: DaemonModuleManifest = {
+			name: "mod",
+			mode: "daemon",
+			exec: "run.ts",
+			moduleDir: "/modules/mod",
+			execPath: "/modules/mod/run.ts",
+			replyable: false,
+		};
+		const pathExists = async (p: string) =>
+			p === "/bin" ||
+			p === "/etc" ||
+			p === "/tmp" ||
+			p === "/modules/mod" ||
+			p === "/etc/myagent";
+		const originalConsoleError = console.error;
+		const errors: unknown[][] = [];
+		console.error = (...args: unknown[]) => {
+			errors.push(args);
+		};
+		try {
+			const cmd = await createLinuxBubblewrapCommand(
+				"/usr/bin/bwrap",
+				manifest,
+				{
+					pathExists,
+					realPath: async (p) => p,
+					env: { JUSTCLAW_SANDBOX_RW_PATHS: "/etc/myagent" },
+				},
+			);
+			const joined = cmd.join(" ");
+			expect(joined).toContain("--ro-bind /etc /etc");
+			expect(joined).toContain("--bind /etc/myagent /etc/myagent");
+			expect(
+				errors.some((args) =>
+					String(args[0]).includes("JUSTCLAW_SANDBOX_RW_PATHS"),
+				),
+			).toBe(true);
+		} finally {
+			console.error = originalConsoleError;
+		}
+	});
+
+	test("operator RW path nested under a standard RO root still gets a --bind, with a warning (workspace sandbox)", async () => {
+		const pathExists = async (p: string) =>
+			p === "/bin" ||
+			p === "/etc" ||
+			p === "/tmp" ||
+			p === "/ws" ||
+			p === "/etc/myagent";
+		const originalConsoleError = console.error;
+		const errors: unknown[][] = [];
+		console.error = (...args: unknown[]) => {
+			errors.push(args);
+		};
+		try {
+			const cmd = await createLinuxWorkspaceBwrapCommand(
+				"/usr/bin/bwrap",
+				"/ws",
+				"/hist",
+				{
+					pathExists,
+					realPath: async (p) => p,
+					bindHistoryDir: false,
+					env: { JUSTCLAW_SANDBOX_RW_PATHS: "/etc/myagent" },
+				},
+			);
+			const joined = cmd.join(" ");
+			expect(joined).toContain("--ro-bind /etc /etc");
+			expect(joined).toContain("--bind /etc/myagent /etc/myagent");
+			expect(
+				errors.some((args) =>
+					String(args[0]).includes("JUSTCLAW_SANDBOX_RW_PATHS"),
+				),
+			).toBe(true);
+		} finally {
+			console.error = originalConsoleError;
+		}
 	});
 
 	test("createWorkspaceSandboxBaseCommand returns bwrap prefix on linux", async () => {
