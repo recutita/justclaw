@@ -124,7 +124,24 @@ async function runTimerLifecycle(
 	initializeTimeoutMs: number,
 ): Promise<void> {
 	const peer = createTimerModulePeer(manifest, proc, queue, sessionStore);
-	const stdoutTask = consumeLines(proc.stdout, (line) => peer.handleLine(line));
+	const stdoutTask = consumeLines(proc.stdout, (line) => {
+		// A single malformed line (invalid JSON, bad envelope) must never tear
+		// down the stream: handleLine throws on such lines, and an unhandled
+		// rejection from consumeLines would crash the core before the finally
+		// block below can await it. Log and keep consuming subsequent lines.
+		try {
+			peer.handleLine(line);
+		} catch (error) {
+			console.error(
+				`[${manifest.name}] ignoring malformed line: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	});
+	// Attach a handler immediately so a stream-level rejection (distinct from
+	// the per-line throw already caught above) is never unhandled while the
+	// initialize/exit awaits below are still pending. The finally block awaits
+	// the same task for ordering.
+	stdoutTask.catch(() => {});
 	void consumeLines(proc.stderr, (line) => {
 		console.error(`[${manifest.name}] ${line}`);
 	});
