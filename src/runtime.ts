@@ -163,10 +163,21 @@ function parseInitializeResult(
 	}
 
 	return tools.map((t, i) => {
-		if (typeof (t as { name?: unknown })?.name !== "string") {
+		const raw = t as { name?: unknown; parameters?: unknown };
+		if (typeof raw?.name !== "string") {
 			throw new Error(`${moduleName}: tool[${i}].name must be a string`);
 		}
-		return t as ToolDefinition;
+		// The wire protocol allows a tool to omit "parameters" (docs/spec.md), but
+		// the SDK's tool() requires a JSON schema object and throws otherwise, outside
+		// the per-event try. Default it here so an omitted "parameters" can't crash
+		// the core the next time this module's tools are built for the LLM.
+		const parameters =
+			typeof raw.parameters === "object" &&
+			raw.parameters !== null &&
+			!Array.isArray(raw.parameters)
+				? (raw.parameters as Record<string, unknown>)
+				: { type: "object", properties: {} };
+		return { ...(t as ToolDefinition), parameters };
 	});
 }
 

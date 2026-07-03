@@ -4227,6 +4227,71 @@ for await (const chunk of Bun.stdin.stream()) {
 	});
 });
 
+describe("module tool without parameters", () => {
+	test("a tool omitting parameters is usable and later events still process", async () => {
+		const homeDir = await createTempDir("justclaw-llm-no-params-");
+		await writeDaemonModule(
+			homeDir,
+			"mod",
+			createModuleScript({
+				initializeResponse: JSON.stringify({ tools: [{ name: "ping" }] }),
+			}),
+		);
+		const ctx = createSessionContext(homeDir);
+		const runtime = await bootstrapRuntime({
+			homeDir,
+			eventQueuePath: path.join(homeDir, "events.db"),
+			...ctx,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+		// parseInitializeResult must default the missing "parameters" field so the
+		// SDK's tool() call below (buildModuleTools, outside the per-event try) does
+		// not throw "Input type is not a ZodObject or a valid JSON schema".
+		expect(runtime.daemons[0]?.tools).toHaveLength(1);
+		expect(runtime.daemons[0]?.tools[0]?.name).toBe("ping");
+		expect(runtime.daemons[0]?.tools[0]?.parameters).toEqual({
+			type: "object",
+			properties: {},
+		});
+
+		const daemonsRef = { current: runtime.daemons };
+		const queue = runtime.eventQueue;
+		const characterDir = path.join(homeDir, "character");
+		await mkdir(characterDir, { recursive: true });
+		await ctx.sessionStore.ensureDefaultSessionIfEmpty();
+		queue.enqueue("mod", { type: "event.v1", kind: "first" });
+		queue.enqueue("mod", { type: "event.v1", kind: "second" });
+
+		let runCount = 0;
+		const mockRunner = {
+			run: async (agent: Agent) => {
+				runCount++;
+				findFunctionTool(agent, "mod__ping");
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, daemonsRef, "test-model", {
+			runner: mockRunner,
+			sessionStore: ctx.sessionStore,
+			workspaceDir: "/tmp/ws",
+			historyDir: path.join(homeDir, "history"),
+			characterDir,
+			modulesRoot: runtime.modulesRoot,
+			sandboxFactory: async (manifest) =>
+				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
+		});
+
+		await waitUntil(() => runCount >= 2);
+		queue.close();
+		await loopTask;
+		await stopDaemons(daemonsRef.current);
+
+		expect(runCount).toBe(2);
+	});
+});
+
 // ---------------------------------------------------------------------------
 // fireTimer
 // ---------------------------------------------------------------------------
