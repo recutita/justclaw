@@ -1809,7 +1809,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		expect(runtime.daemons).toHaveLength(0);
 	});
 
-	test("skips a daemon when stdout emits malformed JSON", async () => {
+	test("skips a daemon whose stdout never emits a valid initialize response", async () => {
 		const homeDir = await createTempDir("justclaw-home-");
 		await writeDaemonModule(
 			homeDir,
@@ -1817,10 +1817,15 @@ for await (const chunk of Bun.stdin.stream()) {
 			createModuleScript({ malformedStdout: true }),
 		);
 
+		// Every line this module emits is malformed, so it never replies to
+		// initialize. A single bad line no longer tears down the daemon (see
+		// pipeStdout), so this now fails via the initialize timeout, not an
+		// immediate stdout-close rejection; keep it short so the test stays fast.
 		const runtime = await bootstrapRuntime({
 			homeDir,
 			eventQueuePath: path.join(homeDir, "events.db"),
 			...createSessionContext(homeDir),
+			initializeTimeoutMs: 50,
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -1936,26 +1941,19 @@ done
 		runtime.eventQueue.close();
 	});
 
-	test("restarts a daemon that emits malformed stdout after initialize", async () => {
+	test("tolerates a single bad stdout line between two valid notifications", async () => {
 		const homeDir = await createTempDir("justclaw-home-");
-		const startCountPath = path.join(homeDir, "malformed-starts.txt");
 		await writeDaemonModule(
 			homeDir,
-			"malformed-after-init",
+			"bad-line-tolerant",
 			`#!/usr/bin/env bun
-let starts = 0;
-try {
-	starts = Number(await Bun.file(${JSON.stringify(startCountPath)}).text());
-} catch {}
-starts += 1;
-await Bun.write(${JSON.stringify(startCountPath)}, String(starts));
 for await (const chunk of Bun.stdin.stream()) {
 	const message = JSON.parse(Buffer.from(chunk).toString("utf8").trim());
 	if (message.method === "initialize") {
 		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { tools: [] } }));
-		if (starts === 1) {
-			console.log("{oops");
-		}
+		console.log(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "event.v1", kind: "before" } }));
+		console.log("{oops");
+		console.log(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "event.v1", kind: "after" } }));
 	} else if (message.method === "shutdown") {
 		console.log(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: "ok" }));
 		process.exit(0);
@@ -1972,15 +1970,14 @@ for await (const chunk of Bun.stdin.stream()) {
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
 
-		await waitUntil(async () => {
-			return (
-				(await readFile(startCountPath, "utf8")) === "2" &&
-				runtime.daemons[0]?.state === "running" &&
-				runtime.daemons[0]?.restartAttempts === 1
-			);
-		});
+		// A malformed line between two valid notifications must not tear down the
+		// daemon or drop the notification that follows it (see pipeStdout).
+		const before = await runtime.eventQueue.next();
+		const after = await runtime.eventQueue.next();
+		expect(before?.params.kind).toBe("before");
+		expect(after?.params.kind).toBe("after");
 		expect(runtime.daemons[0]?.state).toBe("running");
-		expect(runtime.daemons[0]?.restartAttempts).toBe(1);
+		expect(runtime.daemons[0]?.restartAttempts).toBe(0);
 
 		await stopDaemons(runtime.daemons);
 		runtime.eventQueue.close();

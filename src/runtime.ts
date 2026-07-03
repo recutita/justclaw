@@ -297,7 +297,17 @@ async function pipeStdout(
 ): Promise<void> {
 	try {
 		await consumeLines(daemon.process.stdout, (line) => {
-			daemon.peer.handleLine(line);
+			// A single bad line (malformed JSON, unknown notification method, etc.)
+			// must not tear down consumeLines: that would silently drop every valid
+			// message buffered after it and fail an otherwise-healthy daemon. Mirrors
+			// the resilience JsonRpcPeer already applies on the response side.
+			try {
+				daemon.peer.handleLine(line);
+			} catch (error) {
+				console.error(
+					`[${daemon.manifest.name}] ignoring bad stdout line: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
 		});
 		const error = new Error(
 			`${daemon.manifest.name}: stdout closed unexpectedly`,
