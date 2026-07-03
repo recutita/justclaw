@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -13,7 +13,7 @@ import {
 	runLlmLoop,
 	sanitizeHistoryForStorage,
 } from "./llm-loop";
-import type { StartedDaemon } from "./runtime";
+import { type StartedDaemon, stopDaemons } from "./runtime";
 import { buildRuntimeInstructions } from "./runtime-prompt";
 import { SessionStore } from "./session-store";
 
@@ -1692,4 +1692,125 @@ describe("runLlmLoop", () => {
 		expect(droppedTypes).toContain("event.dropped.v1");
 		expect(droppedTypes).not.toContain("message.send.v1");
 	});
+
+	test("restart_modules keeps character INIT injection for new sessions", async () => {
+		const home = await createTempDir("justclaw-llm-restart-init-");
+		const modulesRoot = path.join(home, "modules");
+		const moduleDir = path.join(modulesRoot, "echomod");
+		await mkdir(moduleDir, { recursive: true });
+		await writeFile(
+			path.join(moduleDir, "module.json"),
+			JSON.stringify({ name: "echomod", exec: "./module.ts", mode: "daemon" }),
+		);
+		// On first initialize the module creates a new session and switches to
+		// it. The core's session-request handler injects INIT.md only when it was
+		// started with characterDir, which restart_modules must forward.
+		const moduleScript = `#!/usr/bin/env bun
+const pending = new Map();
+let nextId = 100;
+function sendRequest(method, params) {
+  const id = nextId++;
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\\n");
+  return new Promise((res, rej) => pending.set(id, { res, rej }));
+}
+let initialized = false;
+const chunks = [];
+for await (const chunk of Bun.stdin.stream()) {
+  chunks.push(chunk);
+  const text = Buffer.concat(chunks).toString("utf8");
+  const lines = text.split(/\\r?\\n/);
+  while (lines.length > 1) {
+    const line = lines.shift();
+    if (!line) continue;
+    const msg = JSON.parse(line);
+    if ("method" in msg) {
+      if (msg.method === "initialize") {
+        process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { tools: [] } }) + "\\n");
+        if (!initialized) {
+          initialized = true;
+          (async () => {
+            const created = await sendRequest("sessions", { type: "sessions.new.v1" });
+            await sendRequest("sessions", { type: "sessions.switch.v1", id: created.id });
+          })();
+        }
+      } else if (msg.method === "shutdown") {
+        process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: "ok" }) + "\\n");
+        process.exit(0);
+      }
+    } else {
+      const h = pending.get(msg.id);
+      if (h) { pending.delete(msg.id); "error" in msg ? h.rej(new Error(msg.error.message)) : h.res(msg.result); }
+    }
+  }
+  chunks.length = 0;
+  if (lines[0]) chunks.push(Buffer.from(lines[0]));
+}
+`;
+		const execPath = path.join(moduleDir, "module.ts");
+		await writeFile(execPath, moduleScript);
+		await chmod(execPath, 0o755);
+
+		const characterDir = path.join(home, "character");
+		await mkdir(characterDir, { recursive: true });
+		const initMarker = "INIT_MARKER_TEXT";
+		await writeFile(path.join(characterDir, "INIT.md"), initMarker);
+
+		const sessionStore = new SessionStore(path.join(home, "history"));
+		// A non-empty active session, so the loop's own bootstrap INIT injection
+		// (which fires only for an empty adopted session) stays quiet. The only
+		// remaining INIT source is the reloaded module's sessions.switch.v1
+		// handler, which needs characterDir forwarded through restart_modules.
+		const primedSession = "01900000-0000-7000-8000-0000000000aa";
+		await sessionStore.save(primedSession, [
+			{ role: "user", content: "primed" } as AgentInputItem,
+		]);
+		const queue = new EventQueue(path.join(home, "events.db"));
+		queue.setMeta("active_session_id", primedSession);
+		queue.enqueue("kicker", { type: "event.v1", kind: "kick" });
+
+		const daemonsRef = { current: [] as StartedDaemon[] };
+		const rc = new RunContext();
+		const capturedInputs: string[] = [];
+		let runCount = 0;
+		const mockRunner = {
+			run: async (agent: Agent, input: unknown) => {
+				runCount += 1;
+				if (runCount === 1) {
+					await findFunctionTool(agent, "restart_modules").invoke(
+						rc,
+						JSON.stringify({ continuation: "" }),
+					);
+				} else {
+					capturedInputs.push(JSON.stringify(input));
+				}
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, daemonsRef, "test-model", {
+			runner: mockRunner,
+			sessionStore,
+			modulesRoot,
+			characterDir,
+			sandboxFactory: async (manifest) => ({
+				backend: "sandbox-exec" as const,
+				cmd: [manifest.execPath],
+				cwd: manifest.moduleDir,
+				env: process.env,
+			}),
+		});
+
+		try {
+			await waitUntil(
+				() => capturedInputs.some((i) => i.includes(initMarker)),
+				15000,
+			);
+		} finally {
+			queue.close();
+			await loopTask;
+			await stopDaemons(daemonsRef.current);
+		}
+
+		expect(capturedInputs.some((i) => i.includes(initMarker))).toBe(true);
+	}, 20000);
 });

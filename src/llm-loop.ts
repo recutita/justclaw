@@ -1174,6 +1174,9 @@ export async function runLlmLoop(
 						initializeTimeoutMs: options.initializeTimeoutMs,
 						abortSignal: options.abortSignal,
 						timerSchedulerRef: options.timerSchedulerRef,
+						// Without characterDir the reloaded daemons' session-request
+						// handlers stop injecting INIT.md for new sessions.
+						characterDir: options.characterDir,
 					});
 					const rawContinuation =
 						(input as { continuation: string }).continuation ?? "";
