@@ -347,6 +347,7 @@ function createPeer(
 	queue: EventQueue,
 	sessionStore: SessionStore,
 	daemons: StartedDaemon[],
+	self: { daemon?: StartedDaemon },
 	characterDir?: string,
 ): JsonRpcPeer {
 	return new JsonRpcPeer({
@@ -361,6 +362,14 @@ function createPeer(
 					message.params,
 				);
 				queue.enqueue(manifest.name, params);
+				// Proved healthy: an accepted event resets the consecutive-failure
+				// count so a long-lived daemon is not removed on its next isolated
+				// failure. self.daemon is this peer's own daemon; a name lookup in
+				// daemons[] would hit the stale pre-swap entry during a restart,
+				// because stdout is piped before the replacement is installed.
+				if (self.daemon) {
+					self.daemon.restartAttempts = 0;
+				}
 				return;
 			}
 
@@ -440,12 +449,14 @@ export async function startDaemon(
 		stderr: "pipe",
 	});
 
+	const self: { daemon?: StartedDaemon } = {};
 	const peer = createPeer(
 		manifest,
 		process,
 		options.queue,
 		options.sessionStore,
 		options.daemons ?? [],
+		self,
 		options.characterDir,
 	);
 	const daemon: StartedDaemon = {
@@ -456,6 +467,7 @@ export async function startDaemon(
 		restartAttempts: options.restartAttempts ?? 0,
 		tools: [],
 	};
+	self.daemon = daemon;
 
 	void pipeStdout(
 		daemon,

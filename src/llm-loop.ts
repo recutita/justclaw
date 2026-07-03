@@ -797,6 +797,9 @@ function buildModuleTools(
 						daemon.peer.request(`tool/${toolDef.name}`, input ?? {}),
 						details?.signal,
 					);
+					// Proved healthy: serving a tool call resets the
+					// consecutive-failure count.
+					daemon.restartAttempts = 0;
 					return prepareToolResultForLlm(result, delivery);
 				},
 			}),
