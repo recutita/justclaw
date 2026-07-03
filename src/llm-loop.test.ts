@@ -1566,4 +1566,64 @@ describe("runLlmLoop", () => {
 		expect(payload.params).toEqual(params);
 		expect(payload.timestamp).toBe(timestampFromUUIDv7(row.id));
 	});
+
+	test("drops an event with an invalid XML key instead of killing the loop", async () => {
+		const home = await createTempDir("justclaw-llm-badkey-");
+		const dbPath = path.join(home, "events.db");
+		const queue = new EventQueue(dbPath);
+		// A leading-digit key is rejected by eventToXml; before the fix this threw
+		// out of runLlmLoop before the per-event try block.
+		queue.enqueue("srcmod", { type: "event.v1", "1bad": "x" });
+
+		const recorded: { method: string; params: unknown }[] = [];
+		const daemons = [
+			{
+				manifest: { name: "srcmod" },
+				tools: [],
+				peer: {
+					notify: (method: string, p: unknown) => {
+						recorded.push({ method, params: p });
+					},
+					request: async () => ({}),
+				},
+			},
+		] as unknown as StartedDaemon[];
+
+		let runnerCallCount = 0;
+		const mockRunner = {
+			run: async () => {
+				runnerCallCount++;
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: daemons }, "test-model", {
+			runner: mockRunner,
+		});
+
+		// The queued event is dropped and its row completed.
+		await waitForQueueEmpty(dbPath);
+		for (let i = 0; i < 50 && recorded.length < 1; i += 1) {
+			await delay(10);
+		}
+
+		// An interrupt with an invalid key is dropped the same way.
+		queue.setInterrupt("srcmod", { type: "event.v1", "2bad": "y" });
+		for (let i = 0; i < 50 && recorded.length < 2; i += 1) {
+			await delay(10);
+		}
+
+		queue.close();
+		// The loop must resolve normally, not reject.
+		await loopTask;
+
+		expect(runnerCallCount).toBe(0);
+		expect(recorded).toHaveLength(2);
+		expect((recorded[0]?.params as { type?: string }).type).toBe(
+			"event.dropped.v1",
+		);
+		expect((recorded[1]?.params as { type?: string }).type).toBe(
+			"event.dropped.v1",
+		);
+	});
 });

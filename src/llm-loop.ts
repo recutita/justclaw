@@ -1432,47 +1432,6 @@ export async function runLlmLoop(
 				return { isFinalOutput: false, isInterrupted: undefined };
 			},
 		});
-		const eventForInput = await prepareImageEventForInput(event);
-		const xml = eventToXml(eventForInput);
-		const userInput: AgentInputItem =
-			eventForInput.params.type === "image.send.v1"
-				? ({
-						role: "user",
-						content: [
-							{ type: "input_text", text: xml },
-							{
-								type: "input_image",
-								image: `data:${String(eventForInput.params.mediaType)};base64,${String(eventForInput.params.data)}`,
-							},
-						],
-					} as AgentInputItem)
-				: eventForInput.params.type === "file.send.v1"
-					? ({
-							role: "user",
-							content: [
-								{ type: "input_text", text: xml },
-								{
-									type: "input_file",
-									file: `data:${String(eventForInput.params.mediaType)};base64,${String(eventForInput.params.data)}`,
-									...(typeof eventForInput.params.filename === "string"
-										? { filename: eventForInput.params.filename }
-										: {}),
-								},
-							],
-						} as AgentInputItem)
-					: eventForInput.params.type === "audio.send.v1"
-						? ({
-								role: "user",
-								content: [
-									{ type: "input_text", text: xml },
-									{
-										type: "audio",
-										audio: String(eventForInput.params.data),
-										format: inferAudioFormat(eventForInput.params),
-									},
-								],
-							} as AgentInputItem)
-						: ({ role: "user", content: xml } as AgentInputItem);
 
 		const runController = new AbortController();
 		// Propagate the process-level abort into the per-run controller so that
@@ -1483,6 +1442,51 @@ export async function runLlmLoop(
 		// `await eventQueue.next()`, before currentRunController pointed at it.
 		if (options?.abortSignal?.aborted) runController.abort();
 		try {
+			// Build the LLM input inside the try so an invalid payload (e.g. a
+			// key eventToXml rejects) is dropped like any other per-event failure
+			// instead of throwing out of runLlmLoop and killing the whole loop.
+			const eventForInput = await prepareImageEventForInput(event);
+			const xml = eventToXml(eventForInput);
+			const userInput: AgentInputItem =
+				eventForInput.params.type === "image.send.v1"
+					? ({
+							role: "user",
+							content: [
+								{ type: "input_text", text: xml },
+								{
+									type: "input_image",
+									image: `data:${String(eventForInput.params.mediaType)};base64,${String(eventForInput.params.data)}`,
+								},
+							],
+						} as AgentInputItem)
+					: eventForInput.params.type === "file.send.v1"
+						? ({
+								role: "user",
+								content: [
+									{ type: "input_text", text: xml },
+									{
+										type: "input_file",
+										file: `data:${String(eventForInput.params.mediaType)};base64,${String(eventForInput.params.data)}`,
+										...(typeof eventForInput.params.filename === "string"
+											? { filename: eventForInput.params.filename }
+											: {}),
+									},
+								],
+							} as AgentInputItem)
+						: eventForInput.params.type === "audio.send.v1"
+							? ({
+									role: "user",
+									content: [
+										{ type: "input_text", text: xml },
+										{
+											type: "audio",
+											audio: String(eventForInput.params.data),
+											format: inferAudioFormat(eventForInput.params),
+										},
+									],
+								} as AgentInputItem)
+							: ({ role: "user", content: xml } as AgentInputItem);
+
 			const runInput: string | AgentInputItem[] =
 				session.history.length > 0
 					? [...session.history, userInput]
