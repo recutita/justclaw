@@ -170,6 +170,14 @@ Each module runs inside a platform sandbox (`bwrap` on Linux, `sandbox-exec` on 
 
 The `shell`, `create_file`, `edit_file`, and `delete_file` built-in tools run in a separate workspace sandbox that grants read-write access to the workspace, character, and modules directories, and read-only access to the history directory.
 
+## Skills
+
+The skills directory (`$JUSTCLAW_HOME/skills/` by default, `JUSTCLAW_SKILLS` to override) holds agent skills in the [Agent Skills](https://agentskills.io/) format: one subdirectory per skill containing a `SKILL.md` with YAML frontmatter (`name`, `description`) and Markdown instructions, plus optional scripts and reference files.
+
+Before each turn the core scans the directory and injects a skill index (name + description) into the system prompt. Full instructions are not loaded automatically; the LLM reads a skill's `SKILL.md` when a task matches its description. The directory is read-write inside the workspace sandbox, so the agent can create and edit its own skills; changes take effect on the next turn.
+
+See [Skills directory](docs/spec.md#skills-directory) in the spec for details.
+
 ## Examples
 
 - **[cli-chat](examples/cli-chat/)** — daemon module; local terminal chat via a Unix socket
