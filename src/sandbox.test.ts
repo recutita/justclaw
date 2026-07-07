@@ -270,3 +270,132 @@ describe("workspace sandbox profiles", () => {
 		expect(spec.cmdPrefix[spec.cmdPrefix.length - 1]).toBe("--");
 	});
 });
+
+describe("workspace sandbox environment allowlist", () => {
+	test("filters secrets out of the darwin workspace sandbox env", async () => {
+		const spec = await createWorkspaceSandboxBaseCommand(
+			"/tmp/ws",
+			"/tmp/hist",
+			{
+				platform: "darwin",
+				env: { PATH: "/usr/bin", JUSTCLAW_OPENAI_API_KEY: "secret" },
+				pathExists: async () => true,
+				lookupExecutable: async (command) =>
+					command === "sandbox-exec" ? "/usr/bin/sandbox-exec" : null,
+			},
+		);
+		expect(spec.env.JUSTCLAW_OPENAI_API_KEY).toBeUndefined();
+		expect(spec.env.PATH).toBe("/usr/bin");
+	});
+
+	test("filters secrets out of the linux workspace sandbox env", async () => {
+		const spec = await createWorkspaceSandboxBaseCommand("/ws", "/hist", {
+			platform: "linux",
+			env: { PATH: "/usr/bin", JUSTCLAW_OPENAI_API_KEY: "secret" },
+			pathExists: async (p) =>
+				p === "/bin" ||
+				p === "/tmp" ||
+				p === "/ws" ||
+				p === "/hist" ||
+				p === "/etc/resolv.conf",
+			realPath: async (p) => p,
+			lookupExecutable: async (command) =>
+				command === "bwrap" ? "/usr/bin/bwrap" : null,
+		});
+		expect(spec.env.JUSTCLAW_OPENAI_API_KEY).toBeUndefined();
+		expect(spec.env.PATH).toBe("/usr/bin");
+	});
+
+	test("allows the default allowlist and LC_ prefixed variables through", async () => {
+		const spec = await createWorkspaceSandboxBaseCommand(
+			"/tmp/ws",
+			"/tmp/hist",
+			{
+				platform: "darwin",
+				env: {
+					PATH: "/usr/bin",
+					HOME: "/home/dev",
+					LANG: "en_US.UTF-8",
+					TZ: "UTC",
+					TERM: "xterm",
+					USER: "dev",
+					LOGNAME: "dev",
+					JUSTCLAW_HOME: "/home/dev/justclaw",
+					LC_ALL: "en_US.UTF-8",
+					RANDOM_SECRET: "nope",
+				},
+				pathExists: async () => true,
+				lookupExecutable: async (command) =>
+					command === "sandbox-exec" ? "/usr/bin/sandbox-exec" : null,
+			},
+		);
+		expect(spec.env.PATH).toBe("/usr/bin");
+		expect(spec.env.HOME).toBe("/home/dev");
+		expect(spec.env.LANG).toBe("en_US.UTF-8");
+		expect(spec.env.TZ).toBe("UTC");
+		expect(spec.env.TERM).toBe("xterm");
+		expect(spec.env.USER).toBe("dev");
+		expect(spec.env.LOGNAME).toBe("dev");
+		expect(spec.env.JUSTCLAW_HOME).toBe("/home/dev/justclaw");
+		expect(spec.env.LC_ALL).toBe("en_US.UTF-8");
+		expect(spec.env.RANDOM_SECRET).toBeUndefined();
+	});
+
+	test("JUSTCLAW_SANDBOX_ENV lets additional named variables through, ignoring empty and unset entries", async () => {
+		const spec = await createWorkspaceSandboxBaseCommand(
+			"/tmp/ws",
+			"/tmp/hist",
+			{
+				platform: "darwin",
+				env: {
+					PATH: "/usr/bin",
+					JUSTCLAW_SANDBOX_ENV: "FOO::BAR:MISSING",
+					FOO: "foo-value",
+					BAR: "bar-value",
+				},
+				pathExists: async () => true,
+				lookupExecutable: async (command) =>
+					command === "sandbox-exec" ? "/usr/bin/sandbox-exec" : null,
+			},
+		);
+		expect(spec.env.FOO).toBe("foo-value");
+		expect(spec.env.BAR).toBe("bar-value");
+		expect(spec.env.MISSING).toBeUndefined();
+		// JUSTCLAW_SANDBOX_ENV names variables to let through; it does not name itself.
+		expect(spec.env.JUSTCLAW_SANDBOX_ENV).toBeUndefined();
+	});
+
+	test("linux workspace sandbox still forces TMPDIR to /tmp regardless of host TMPDIR", async () => {
+		const spec = await createWorkspaceSandboxBaseCommand("/ws", "/hist", {
+			platform: "linux",
+			env: { PATH: "/usr/bin", TMPDIR: "/custom/tmp" },
+			pathExists: async (p) =>
+				p === "/bin" ||
+				p === "/tmp" ||
+				p === "/ws" ||
+				p === "/hist" ||
+				p === "/etc/resolv.conf",
+			realPath: async (p) => p,
+			lookupExecutable: async (command) =>
+				command === "bwrap" ? "/usr/bin/bwrap" : null,
+		});
+		expect(spec.env.TMPDIR).toBe("/tmp");
+	});
+
+	test("JUSTCLAW_SANDBOX_RO_PATHS still reaches the mount resolver after the env allowlist filter (linux)", async () => {
+		const pathExists = async (p: string) =>
+			p === "/tmp" || p === "/ws" || p === "/srv/extra";
+		const spec = await createWorkspaceSandboxBaseCommand("/ws", "/hist", {
+			platform: "linux",
+			env: { PATH: "/usr/bin", JUSTCLAW_SANDBOX_RO_PATHS: "/srv/extra" },
+			pathExists,
+			realPath: async (p) => p,
+			lookupExecutable: async (command) =>
+				command === "bwrap" ? "/usr/bin/bwrap" : null,
+		});
+		const joined = spec.cmdPrefix.join(" ");
+		expect(joined).toContain("--ro-bind /srv/extra /srv/extra");
+		// The path env vars themselves are not part of the filtered spawn env.
+		expect(spec.env.JUSTCLAW_SANDBOX_RO_PATHS).toBeUndefined();
+	});
+});

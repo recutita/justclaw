@@ -78,6 +78,7 @@ Type a message and press Enter. The LLM response is printed to the same terminal
 | `JUSTCLAW_MAX_RESTART_ATTEMPTS` | no | `1` | Maximum automatic restarts for a daemon that exits unexpectedly. Non-negative integer (`0` disables restart) |
 | `JUSTCLAW_SANDBOX_RO_PATHS` | no | — | Colon-separated absolute paths mounted read-only into the module sandbox and the workspace sandbox |
 | `JUSTCLAW_SANDBOX_RW_PATHS` | no | — | Colon-separated absolute paths mounted read-write into the module sandbox and the workspace sandbox (reachable by the LLM via the workspace sandbox) |
+| `JUSTCLAW_SANDBOX_ENV` | no | — | Colon-separated variable names to pass into the workspace sandbox in addition to its default allowlist (`PATH`, `HOME`, `TMPDIR`, `LANG`, `TZ`, `TERM`, `USER`, `LOGNAME`, `JUSTCLAW_HOME`, and any `LC_*` variable) |
 
 ## Architecture
 
