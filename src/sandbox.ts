@@ -405,6 +405,63 @@ async function resolveOperatorSandboxMounts(
 	return { readonlyPaths, readWritePaths };
 }
 
+// Variable names always let through the workspace sandbox: enough for a shell to
+// find its interpreter, know its home/temp/locale, and resolve JUSTCLAW_HOME. Any
+// LC_* variable is also let through since locale customization uses an open-ended
+// set of names (LC_ALL, LC_TIME, LC_COLLATE, ...).
+const WORKSPACE_SANDBOX_ENV_ALLOWLIST = new Set([
+	"PATH",
+	"HOME",
+	"TMPDIR",
+	"LANG",
+	"TZ",
+	"TERM",
+	"USER",
+	"LOGNAME",
+	"JUSTCLAW_HOME",
+]);
+
+/**
+ * Parses JUSTCLAW_SANDBOX_ENV (colon-separated variable names) into a list of
+ * names to additionally let through the workspace sandbox allowlist. Unlike
+ * JUSTCLAW_SANDBOX_RO_PATHS/_RW_PATHS this only names variables, not paths, so
+ * there is nothing on the host to validate; a name absent from envBase is
+ * silently dropped when the allowlist filter runs.
+ */
+function parseSandboxEnvAllowlist(rawValue: string | undefined): string[] {
+	return (rawValue ?? "")
+		.split(":")
+		.map((entry) => entry.trim())
+		.filter((entry) => entry.length > 0);
+}
+
+/**
+ * The workspace sandbox is the shell boundary the LLM drives directly (via
+ * `sh -c`), unlike createSandboxLaunchSpec's module/timer processes, which are
+ * legitimate consumers of secrets such as JUSTCLAW_OPENAI_API_KEY. Passing the
+ * parent env through unfiltered here would let the LLM read those secrets with
+ * `printenv`. Filter to a small allowlist instead; JUSTCLAW_SANDBOX_ENV lets an
+ * operator extend it for tools the LLM legitimately needs (e.g. BRAVE_API_KEY
+ * for a search tool invoked from the workspace shell).
+ */
+function filterWorkspaceSandboxEnv(
+	envBase: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+	const extraNames = parseSandboxEnvAllowlist(envBase.JUSTCLAW_SANDBOX_ENV);
+	const allowed = new Set([...WORKSPACE_SANDBOX_ENV_ALLOWLIST, ...extraNames]);
+
+	const filtered: NodeJS.ProcessEnv = {};
+	for (const [key, value] of Object.entries(envBase)) {
+		if (value === undefined) {
+			continue;
+		}
+		if (allowed.has(key) || key.startsWith("LC_")) {
+			filtered[key] = value;
+		}
+	}
+	return filtered;
+}
+
 function appendReadonlyMount(cmd: string[], mountPath: string): void {
 	appendDestinationAncestors(cmd, mountPath);
 	cmd.push("--ro-bind", mountPath, mountPath);
@@ -675,12 +732,18 @@ export async function createWorkspaceSandboxBaseCommand(
 	const historyExists = await pathExists(historyDir);
 
 	if (platform === "darwin") {
-		const env = { ...envBase };
+		const env = filterWorkspaceSandboxEnv(envBase);
 		const sandboxExecPath = await lookupExecutable("sandbox-exec", env);
 		if (!sandboxExecPath) {
 			throw new Error("sandbox-exec backend is unavailable");
 		}
-		const operatorMounts = await resolveOperatorSandboxMounts(env, pathExists);
+		// Operator path allowlists live in envBase (JUSTCLAW_SANDBOX_RO/RW_PATHS
+		// are not themselves in the workspace env allowlist, so they don't survive
+		// filterWorkspaceSandboxEnv above).
+		const operatorMounts = await resolveOperatorSandboxMounts(
+			envBase,
+			pathExists,
+		);
 		const profile = createDarwinWorkspaceSandboxProfile(
 			workspaceDir,
 			historyDir,
@@ -700,7 +763,9 @@ export async function createWorkspaceSandboxBaseCommand(
 	}
 
 	if (platform === "linux") {
-		const env = { ...envBase, TMPDIR: "/tmp" };
+		// The host TMPDIR may point at a path that does not exist inside the
+		// bwrap root; /tmp is always mounted writable, so pin TMPDIR to it.
+		const env = { ...filterWorkspaceSandboxEnv(envBase), TMPDIR: "/tmp" };
 		const bwrapPath = await lookupExecutable("bwrap", env);
 		if (!bwrapPath) {
 			throw new Error("bwrap backend is unavailable");
@@ -710,7 +775,11 @@ export async function createWorkspaceSandboxBaseCommand(
 			workspaceDir,
 			historyDir,
 			{
-				env,
+				// Same reasoning as the darwin branch above: pass the unfiltered
+				// envBase so resolveOperatorSandboxMounts (called inside) still sees
+				// JUSTCLAW_SANDBOX_RO/RW_PATHS. The filtered `env` above is only for
+				// the spawned process's environment.
+				env: envBase,
 				pathExists,
 				realPath,
 				bindHistoryDir: historyExists,
@@ -743,6 +812,10 @@ export async function createSandboxLaunchSpec(
 	options: SandboxOptions = {},
 ): Promise<SandboxLaunchSpec> {
 	const platform = options.platform ?? process.platform;
+	// On Linux the host TMPDIR may point at a path that does not exist inside
+	// the bwrap root; /tmp is always mounted writable, so pin TMPDIR to it.
+	// On darwin the host paths remain visible, so the sandbox profile allows
+	// the host TMPDIR instead (see getDarwinTempPaths).
 	const env =
 		platform === "linux"
 			? { ...(options.env ?? process.env), TMPDIR: "/tmp" }
