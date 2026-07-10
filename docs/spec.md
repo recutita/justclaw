@@ -572,6 +572,8 @@ Required frontmatter fields:
 | `name` | Short identifier. Should match the directory name. |
 | `description` | One sentence describing when the skill applies. Shown to the LLM in the skill index. |
 
+Both fields must be YAML strings. Values that YAML types as something else are treated as missing, so quote names that read as other scalars (e.g. `name: "true"`, `name: "123"`).
+
 ### Skill discovery
 
 Before each LLM turn, the bundled loop scans `skills/*/SKILL.md`, parses frontmatter, and injects a skill index (name + description table) into the runtime instructions. Full skill content is not loaded automatically; the LLM reads it on demand via `shell`.

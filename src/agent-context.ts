@@ -116,34 +116,36 @@ export async function loadAgentContext(characterDir: string): Promise<string> {
 }
 
 /**
- * Parses YAML frontmatter from a SKILL.md file.
- * Splits only on the first colon per line so unquoted values containing colons
- * are handled correctly. Quoted values have their surrounding quotes stripped.
+ * Parses YAML frontmatter from a SKILL.md file and extracts name and description.
+ * Both fields are strings per the Agent Skills spec; values of any other YAML
+ * type (e.g. an unquoted `name: true`) are treated as missing rather than
+ * coerced, so the author gets a warning instead of a silently mangled value.
  * Returns null when the file does not begin with a valid `---` block.
  */
-function parseFrontmatter(content: string): Record<string, string> | null {
+function parseFrontmatter(
+	content: string,
+): { name?: string; description?: string } | null {
 	if (!content.startsWith("---")) return null;
 	const firstNewline = content.indexOf("\n");
 	if (firstNewline === -1) return null;
 	const rest = content.slice(firstNewline + 1);
 	const closingMatch = rest.match(/^---[ \t]*$/m);
 	if (!closingMatch || closingMatch.index === undefined) return null;
-	const yaml = rest.slice(0, closingMatch.index);
-	const result: Record<string, string> = {};
-	for (const line of yaml.split("\n")) {
-		const colonIdx = line.indexOf(":");
-		if (colonIdx === -1) continue;
-		const key = line.slice(0, colonIdx).trim();
-		let value = line.slice(colonIdx + 1).trim();
-		if (
-			(value.startsWith('"') && value.endsWith('"')) ||
-			(value.startsWith("'") && value.endsWith("'"))
-		) {
-			value = value.slice(1, -1);
-		}
-		if (key) result[key] = value;
+	let parsed: unknown;
+	try {
+		parsed = Bun.YAML.parse(rest.slice(0, closingMatch.index));
+	} catch {
+		return null;
 	}
-	return result;
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		return null;
+	}
+	const fm = parsed as Record<string, unknown>;
+	return {
+		name: typeof fm.name === "string" ? fm.name : undefined,
+		description:
+			typeof fm.description === "string" ? fm.description : undefined,
+	};
 }
 
 /**
