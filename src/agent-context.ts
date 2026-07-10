@@ -86,9 +86,10 @@ export async function loadHomeAgentsFile(homeDir: string): Promise<string> {
 /**
  * Reads present files from {@link CHARACTER_FILES} under `characterDir`.
  * Each non-empty file is fenced in an XML element named after the file:
- * `<FILENAME>\n<content>\n</FILENAME>`. The fence delimits each block
- * unambiguously so file content cannot impersonate a sibling section or the
- * surrounding runtime instructions. Sections are joined with a blank line.
+ * `<FILENAME>\n<content>\n</FILENAME>`. The fence labels each block's origin;
+ * content is not escaped, so it is forgeable by content that emits closing
+ * tags (see "Fence trust model" in docs/spec.md for why that is acceptable).
+ * Sections are joined with a blank line.
  * Missing files are silently skipped; other read errors propagate.
  * Reads text() directly rather than checking exists() first: a file removed
  * between the check and the read would otherwise throw ENOENT and crash the
@@ -116,34 +117,36 @@ export async function loadAgentContext(characterDir: string): Promise<string> {
 }
 
 /**
- * Parses YAML frontmatter from a SKILL.md file.
- * Splits only on the first colon per line so unquoted values containing colons
- * are handled correctly. Quoted values have their surrounding quotes stripped.
+ * Parses YAML frontmatter from a SKILL.md file and extracts name and description.
+ * Both fields are strings per the Agent Skills spec; values of any other YAML
+ * type (e.g. an unquoted `name: true`) are treated as missing rather than
+ * coerced, so the author gets a warning instead of a silently mangled value.
  * Returns null when the file does not begin with a valid `---` block.
  */
-function parseFrontmatter(content: string): Record<string, string> | null {
+function parseFrontmatter(
+	content: string,
+): { name?: string; description?: string } | null {
 	if (!content.startsWith("---")) return null;
 	const firstNewline = content.indexOf("\n");
 	if (firstNewline === -1) return null;
 	const rest = content.slice(firstNewline + 1);
 	const closingMatch = rest.match(/^---[ \t]*$/m);
 	if (!closingMatch || closingMatch.index === undefined) return null;
-	const yaml = rest.slice(0, closingMatch.index);
-	const result: Record<string, string> = {};
-	for (const line of yaml.split("\n")) {
-		const colonIdx = line.indexOf(":");
-		if (colonIdx === -1) continue;
-		const key = line.slice(0, colonIdx).trim();
-		let value = line.slice(colonIdx + 1).trim();
-		if (
-			(value.startsWith('"') && value.endsWith('"')) ||
-			(value.startsWith("'") && value.endsWith("'"))
-		) {
-			value = value.slice(1, -1);
-		}
-		if (key) result[key] = value;
+	let parsed: unknown;
+	try {
+		parsed = Bun.YAML.parse(rest.slice(0, closingMatch.index));
+	} catch {
+		return null;
 	}
-	return result;
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		return null;
+	}
+	const fm = parsed as Record<string, unknown>;
+	return {
+		name: typeof fm.name === "string" ? fm.name : undefined,
+		description:
+			typeof fm.description === "string" ? fm.description : undefined,
+	};
 }
 
 /**
