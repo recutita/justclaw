@@ -1405,7 +1405,7 @@ export async function runLlmLoop(
 		const contextInstructions =
 			[
 				operatorContext
-					? `<operator-instructions>\n${operatorContext}\n</operator-instructions>`
+					? `<system-instructions>\n${operatorContext}\n</system-instructions>`
 					: undefined,
 				characterContext,
 			]
