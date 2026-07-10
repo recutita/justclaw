@@ -478,7 +478,7 @@ These are operator input, not module input, so there is no per-module injection 
 
 ## Operator instructions
 
-The bundled entrypoint reads `$JUSTCLAW_HOME/AGENTS.md` before every LLM turn. If present, its content is fenced in a `<system-instructions>` element and prepended to the character context instructions. The dedicated tag — distinct from the character-file tags below — keeps the trust boundary explicit: operator instructions live in a fixed file the agent cannot edit, and the fence separates them from editable character content.
+The bundled entrypoint reads `$JUSTCLAW_HOME/AGENTS.md` before every LLM turn. If present, its content is fenced in a `<system-instructions>` element and prepended to the character context instructions. The dedicated tag — distinct from the character-file tags below — labels the content's origin: operator instructions live in a fixed file the agent cannot edit, and the fence separates them from editable character content. The fence is a delimiter, not an enforcement mechanism; see [Fence trust model](#fence-trust-model).
 
 This file is outside all sandbox write paths, so the agent cannot modify it. Changes to the file take effect on the next turn without restarting the process.
 
@@ -519,7 +519,7 @@ The core reads the following files from the character directory, in order:
 </FILENAME.md>
 ```
 
-The tag name is the filename itself (e.g. `<SOUL.md>`); runtime instructions document what each file means, so no descriptive attribute is needed. The fence delimits each block unambiguously, so a file's content cannot impersonate a sibling section or the surrounding runtime instructions by emitting a matching heading. File content stays Markdown; only the boundary is XML. Sections are joined with a blank line. The combined string becomes **context instructions** in the agent system prompt (see [Agent system prompt](#agent-system-prompt)).
+The tag name is the filename itself (e.g. `<SOUL.md>`); runtime instructions document what each file means, so no descriptive attribute is needed. The fence delimits blocks whose content does not itself emit closing tags; it is not proof against forgery (see [Fence trust model](#fence-trust-model)). File content stays Markdown; only the boundary is XML. Sections are joined with a blank line. The combined string becomes **context instructions** in the agent system prompt (see [Agent system prompt](#agent-system-prompt)).
 
 Missing files are silently skipped. An empty directory (or one containing none of the above filenames) produces empty context instructions. Other I/O errors from reading a present file propagate and abort `runLlmLoop` (they are not caught per-event).
 
@@ -590,6 +590,14 @@ The bundled LLM loop rebuilds the agent `instructions` string immediately before
 | Runtime instructions | `buildRuntimeInstructions` | Canonical paths and operational guidance (workspace, history layout, character files table, modules directory path, table of loaded modules with replyable flag and tool names, and skill index when a skills directory is configured), fenced in a `<runtime>` element. Inner prose is Markdown; only the boundary is XML. |
 
 The core concatenates context instructions and runtime instructions with a **blank line** between them (`\n\n`). Each part is fenced in XML elements (`<system-instructions>`, the per-file character tags, and `<runtime>`) so the model can tell operator instructions, editable character content, and machine-supplied runtime facts apart. Runtime instructions are omitted unless the builder has the workspace path, history path, character path, modules directory path, and the current module list (the bundled entrypoint supplies all of these). Callers without a `characterDir` may still supply static context instructions (tests only in-tree).
+
+### Fence trust model
+
+The fences label origin for cooperative content; they are not an unforgeable boundary. File content is inserted without escaping (only event payloads are XML-escaped), so a character file containing a literal `</AGENTS.md>` followed by a `<system-instructions>` block produces a byte stream textually indistinguishable from a real operator block. The same applies to skill descriptions and module names interpolated into the `<runtime>` block.
+
+This is acceptable because every writer of fenced content is already inside the trust boundary: the operator (who can edit the real `$JUSTCLAW_HOME/AGENTS.md` directly) and the agent itself (whose character files the model already follows as instructions, fence or no fence). Module sandboxes do not mount the character or skills directories, so modules cannot plant content. Forging a fence therefore grants no privilege the writer does not already have. Note also that no precedence rule between `<system-instructions>` and character content is stated anywhere in the prompt; the tags distinguish origin, not authority.
+
+This reasoning is load-bearing. Two changes would invalidate it, and either one requires making the fence unforgeable first (e.g. closing tags carrying an unpredictable per-turn nonce that content cannot know): a prompt rule that gives `<system-instructions>` authority over character content, or any code path that writes character or skills files from untrusted input.
 
 Before each LLM turn, the bundled loop refreshes the module table from the currently loaded daemons so `replyable` and tool names match the live process set. A successful `restart_modules` updates processes immediately and **ends the current LLM run**. The **next** dequeued event gets the updated prompt and module tool names.
 

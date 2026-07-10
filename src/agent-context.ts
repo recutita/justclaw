@@ -86,9 +86,10 @@ export async function loadHomeAgentsFile(homeDir: string): Promise<string> {
 /**
  * Reads present files from {@link CHARACTER_FILES} under `characterDir`.
  * Each non-empty file is fenced in an XML element named after the file:
- * `<FILENAME>\n<content>\n</FILENAME>`. The fence delimits each block
- * unambiguously so file content cannot impersonate a sibling section or the
- * surrounding runtime instructions. Sections are joined with a blank line.
+ * `<FILENAME>\n<content>\n</FILENAME>`. The fence labels each block's origin;
+ * content is not escaped, so it is forgeable by content that emits closing
+ * tags (see "Fence trust model" in docs/spec.md for why that is acceptable).
+ * Sections are joined with a blank line.
  * Missing files are silently skipped; other read errors propagate.
  * Reads text() directly rather than checking exists() first: a file removed
  * between the check and the read would otherwise throw ENOENT and crash the

@@ -1400,8 +1400,11 @@ export async function runLlmLoop(
 			? await loadAgentContext(options.characterDir)
 			: options?.contextInstructions;
 		// Operator instructions live in a fixed file the agent cannot edit, so they
-		// get their own tag distinct from the editable character files — the fence
-		// keeps the trust boundary explicit and unforgeable by file content.
+		// get their own tag distinct from the editable character files. The fence
+		// labels origin only — content is not escaped, so a character file can emit
+		// a forged <system-instructions> block. Acceptable because all writers are
+		// inside the trust boundary; see "Fence trust model" in docs/spec.md before
+		// giving this tag authority over character content.
 		const contextInstructions =
 			[
 				operatorContext
