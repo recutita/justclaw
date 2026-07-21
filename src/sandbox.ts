@@ -77,6 +77,11 @@ const DARWIN_READONLY_PATHS = [
 	// nix-on-macOS setup `sh`/`base64`/module interpreters resolve there and fail
 	// to load their libraries unless the store is readable. Mirrors LINUX_READONLY_PATHS.
 	"/nix",
+	// nix-darwin's system profile: a symlink farm (coreutils, base64, etc.) whose
+	// targets resolve into /nix/store, but the farm directory itself lives
+	// outside /nix, so it needs its own entry. Same rationale as the Linux entry
+	// of the same name below.
+	"/run/current-system/sw",
 ] as const;
 const LINUX_READONLY_PATHS = [
 	"/bin",
@@ -89,7 +94,22 @@ const LINUX_READONLY_PATHS = [
 	"/lib",
 	"/lib64",
 	"/nix",
+	// NixOS's system profile: a symlink farm (coreutils, base64, etc.) whose
+	// targets resolve into /nix/store (already bound above), but the farm
+	// directory itself lives outside /nix, so PATH lookups for `base64`, `cat`,
+	// `mkdir`, etc. fail inside the sandbox without this entry.
+	"/run/current-system/sw",
 ] as const;
+
+/**
+ * A plain `nix-env`/home-manager install without a system profile exposes
+ * coreutils via this per-user symlink farm instead of /run/current-system/sw.
+ * Not covered by /nix or /run/current-system/sw for the same reason as those:
+ * the farm directory lives under $HOME, outside the Nix store.
+ */
+function getNixProfileBinPaths(env: NodeJS.ProcessEnv): string[] {
+	return env.HOME ? [path.join(env.HOME, ".nix-profile", "bin")] : [];
+}
 
 async function defaultPathExists(path: string): Promise<boolean> {
 	try {
@@ -195,11 +215,16 @@ export function createDarwinSandboxProfile(
 	const extraReadWriteAncestorLiterals = extraReadWritePaths.flatMap((p) =>
 		collectDarwinAncestorLiterals(p),
 	);
+	const nixProfileBinPaths = getNixProfileBinPaths(env);
+	const nixProfileBinAncestorLiterals = nixProfileBinPaths.flatMap((p) =>
+		collectDarwinAncestorLiterals(p),
+	);
 
 	const allowedReadonlySubpaths = [
 		moduleDir,
 		...DARWIN_READONLY_PATHS,
 		...getDarwinTempPaths(env),
+		...nixProfileBinPaths,
 		...extraReadonlyPaths,
 		...extraReadWritePaths,
 	]
@@ -221,6 +246,7 @@ export function createDarwinSandboxProfile(
 		"(allow file-read* file-map-executable",
 		allowedReadonlySubpaths,
 		...moduleDirAncestorLiterals,
+		...nixProfileBinAncestorLiterals,
 		...extraReadWriteAncestorLiterals,
 		")",
 		"(allow file-write*",
@@ -276,6 +302,10 @@ export function createDarwinWorkspaceSandboxProfile(
 	const extraReadWriteAncestors = extraReadWritePaths.flatMap((p) =>
 		collectDarwinAncestorLiterals(p),
 	);
+	const nixProfileBinPaths = getNixProfileBinPaths(env);
+	const nixProfileBinAncestors = nixProfileBinPaths.flatMap((p) =>
+		collectDarwinAncestorLiterals(p),
+	);
 
 	const readonlySubpathEntries = [
 		workspaceDir,
@@ -285,6 +315,7 @@ export function createDarwinWorkspaceSandboxProfile(
 		...(skillsDir ? [skillsDir] : []),
 		...DARWIN_READONLY_PATHS,
 		...getDarwinTempPaths(env),
+		...nixProfileBinPaths,
 		...extraReadonlyPaths,
 		...extraReadWritePaths,
 	]
@@ -310,6 +341,7 @@ export function createDarwinWorkspaceSandboxProfile(
 		...characterAncestors,
 		...modulesAncestors,
 		...skillsAncestors,
+		...nixProfileBinAncestors,
 		...extraReadWriteAncestors,
 		")",
 		"(allow file-write*",
@@ -517,6 +549,15 @@ export async function createLinuxBubblewrapCommand(
 			roRoots.add(readonlyPath);
 		}
 	}
+	for (const nixProfileBinPath of getNixProfileBinPaths(env)) {
+		if (
+			!isPathCoveredByAny(nixProfileBinPath, roRoots, rwRoots) &&
+			(await pathExists(nixProfileBinPath))
+		) {
+			appendReadonlyMount(cmd, nixProfileBinPath);
+			roRoots.add(nixProfileBinPath);
+		}
+	}
 
 	if (await pathExists("/etc/resolv.conf")) {
 		try {
@@ -615,6 +656,15 @@ export async function createLinuxWorkspaceBwrapCommand(
 		if (await pathExists(readonlyPath)) {
 			appendReadonlyMount(cmd, readonlyPath);
 			roRoots.add(readonlyPath);
+		}
+	}
+	for (const nixProfileBinPath of getNixProfileBinPaths(env)) {
+		if (
+			!isPathCoveredByAny(nixProfileBinPath, roRoots, rwRoots) &&
+			(await pathExists(nixProfileBinPath))
+		) {
+			appendReadonlyMount(cmd, nixProfileBinPath);
+			roRoots.add(nixProfileBinPath);
 		}
 	}
 
