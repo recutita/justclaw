@@ -102,6 +102,50 @@ export function resolveMaxTurns(): number {
 	return parsed;
 }
 
+// Whether to strip reasoning items carried over from previous events before
+// sending the history to the model. Defaults to keeping them: the Responses
+// API path carries only an item id (no summary or encrypted content is
+// requested), which costs almost nothing and lets the provider continue the
+// prior reasoning. The Chat Completions path is where this earns its keep — a
+// provider that returns `message.reasoning` (OpenRouter-style) has that raw
+// text replayed in full on every subsequent event, for no benefit across
+// events.
+export function resolveDropReasoningHistory(): boolean {
+	const raw = process.env.JUSTCLAW_DROP_REASONING_HISTORY;
+	if (raw === undefined || raw === "") {
+		return false;
+	}
+	if (raw === "0") {
+		return false;
+	}
+	if (raw === "1") {
+		return true;
+	}
+	throw new Error(
+		`JUSTCLAW_DROP_REASONING_HISTORY must be "0" or "1", got ${JSON.stringify(raw)}`,
+	);
+}
+
+/**
+ * Drops reasoning items from a stored history before it becomes model input.
+ *
+ * Only applied to history carried over from previous events. Reasoning
+ * generated inside the current run lives in the SDK's own generated-items list
+ * and never passes through here, so a tool-calling chain keeps the reasoning
+ * continuity that both the Responses API and Anthropic-style thinking require
+ * within a turn.
+ *
+ * Dropping the reasoning item itself (rather than anything that follows it) is
+ * the safe direction for the Responses API: it never leaves a reasoning item
+ * without its required following item, and function calls are matched by
+ * `callId`, not by reasoning id.
+ */
+export function dropReasoningItems(
+	history: AgentInputItem[],
+): AgentInputItem[] {
+	return history.filter((item) => item.type !== "reasoning");
+}
+
 function escapeXml(s: string): string {
 	return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
@@ -1002,6 +1046,7 @@ export async function runLlmLoop(
 ): Promise<void> {
 	const runner = options?.runner ?? new Runner({ tracingDisabled: true });
 	const maxTurns = resolveMaxTurns();
+	const dropReasoningHistory = resolveDropReasoningHistory();
 	const sessionStore = options?.sessionStore;
 	const baseAgent = new Agent({
 		name: "justclaw",
@@ -1526,9 +1571,16 @@ export async function runLlmLoop(
 								} as AgentInputItem)
 							: ({ role: "user", content: xml } as AgentInputItem);
 
+			// Filter here, not at the storage boundary: the persisted history stays
+			// a complete record of what the model produced, including reasoning,
+			// so it remains usable as an audit trail when the agent misbehaves.
+			// Only the copy handed to the model is reduced.
+			const modelHistory = dropReasoningHistory
+				? dropReasoningItems(session.history)
+				: session.history;
 			const runInput: string | AgentInputItem[] =
-				session.history.length > 0
-					? [...session.history, userInput]
+				modelHistory.length > 0
+					? [...modelHistory, userInput]
 					: eventForInput.params.type === "event.v1"
 						? xml
 						: [userInput];
@@ -1548,7 +1600,17 @@ export async function runLlmLoop(
 			}
 			eventQueue.setRunController(null);
 			const text = result.finalOutput;
-			session.history = sanitizeHistoryForStorage(result.history);
+			// `result.history` is the run's input verbatim, followed by the items the
+			// run generated (@openai/agents `getTurnInput`; only the generated tail
+			// is ever pruned). Storing it directly would write back the *filtered*
+			// input, erasing on this save the very reasoning the filter deliberately
+			// left on disk. Re-anchor on the unfiltered history and append only what
+			// this run added. When nothing was filtered `modelHistory` is
+			// `session.history`, so this reduces to `result.history` unchanged.
+			session.history = sanitizeHistoryForStorage([
+				...session.history,
+				...result.history.slice(modelHistory.length),
+			]);
 			if (sessionStore && session.currentSessionId !== null) {
 				// Re-check liveness immediately before writing. sessions.delete.v1
 				// removes the history file mid-run; the completing turn must not

@@ -387,6 +387,27 @@ The core does not bound a session's history by size, age, or token count. A sess
 
 Capping and compacting history is deliberately left as agent policy, not core mechanism. The core's contribution is two primitives: sessions (`sessions.new.v1`, `sessions.switch.v1`) and `MEMORY.md`, a character-directory file re-read from disk before every turn (see [Character files](#character-files)). The expected operating model built on top of those primitives: the agent summarizes durable facts (user preferences, ongoing project state, anything worth keeping beyond the current conversation) into `MEMORY.md`, or hands them to a dedicated module for storage, since both persist independently of any one session's history. When a session's history has grown large enough to warrant a reset, the agent starts a new session with `sessions.new.v1` and activates it with `sessions.switch.v1`, rather than continuing to grow the old session indefinitely.
 
+### Reasoning in session history
+
+Models that emit reasoning have those items stored in the session history alongside messages and tool calls. Within a single event they are always replayed: a tool-calling chain requires the reasoning that preceded each call, and removing it mid-chain breaks the run.
+
+Across events the trade-off differs by API mode. Under `responses` the stored item carries an id and no summary — the core requests neither reasoning summaries nor encrypted content — so replaying it costs almost nothing and lets the provider continue the earlier reasoning. Under `chat_completions` a provider that returns a `reasoning` field on the assistant message has that raw text replayed in full on every later event, which grows the history for no benefit once the event that produced it is finished.
+
+`JUSTCLAW_DROP_REASONING_HISTORY=1` removes reasoning items carried over from previous events before the history is handed to the model. It does not touch reasoning produced inside the current event.
+
+The history file on disk is unaffected by the setting. Reasoning is the record of how the agent reached a decision, so it stays on disk for inspection after the fact even when it is withheld from the model:
+
+```
+history/{id}.json   every reasoning item, always
+       │
+       └─ minus previous events' reasoning (when the flag is 1)
+              │
+              ▼
+          model input
+```
+
+This is the only place where the persisted history and the input sent to the model intentionally differ. The two must not be "reconciled": the divergence is what preserves the audit trail. Concretely, the stored history is rebuilt from the unfiltered history plus the items the run generated, rather than from the run result directly — writing the run result back would erase the withheld reasoning from disk on the next save.
+
 ## Lifecycle (daemon)
 
 ```
