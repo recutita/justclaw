@@ -10,6 +10,8 @@ import { RunContext } from "@openai/agents-core";
 import { EventQueue, timestampFromUUIDv7 } from "./event-queue";
 import {
 	downscaleImage,
+	dropReasoningItems,
+	resolveDropReasoningHistory,
 	runLlmLoop,
 	sanitizeHistoryForStorage,
 } from "./llm-loop";
@@ -26,12 +28,18 @@ const hasSandbox =
 
 const tempDirs: string[] = [];
 const originalOpenAIAPI = process.env.JUSTCLAW_OPENAI_API;
+const originalDropReasoning = process.env.JUSTCLAW_DROP_REASONING_HISTORY;
 
 afterEach(async () => {
 	if (originalOpenAIAPI === undefined) {
 		delete process.env.JUSTCLAW_OPENAI_API;
 	} else {
 		process.env.JUSTCLAW_OPENAI_API = originalOpenAIAPI;
+	}
+	if (originalDropReasoning === undefined) {
+		delete process.env.JUSTCLAW_DROP_REASONING_HISTORY;
+	} else {
+		process.env.JUSTCLAW_DROP_REASONING_HISTORY = originalDropReasoning;
 	}
 	while (tempDirs.length > 0) {
 		const dir = tempDirs.pop();
@@ -291,6 +299,51 @@ describe("downscaleImage", () => {
 		} finally {
 			console.error = originalConsoleError;
 		}
+	});
+});
+
+describe("resolveDropReasoningHistory", () => {
+	test("defaults to keeping reasoning when unset or empty", () => {
+		delete process.env.JUSTCLAW_DROP_REASONING_HISTORY;
+		expect(resolveDropReasoningHistory()).toBe(false);
+		process.env.JUSTCLAW_DROP_REASONING_HISTORY = "";
+		expect(resolveDropReasoningHistory()).toBe(false);
+	});
+
+	test("parses 0 and 1", () => {
+		process.env.JUSTCLAW_DROP_REASONING_HISTORY = "0";
+		expect(resolveDropReasoningHistory()).toBe(false);
+		process.env.JUSTCLAW_DROP_REASONING_HISTORY = "1";
+		expect(resolveDropReasoningHistory()).toBe(true);
+	});
+
+	test("rejects anything else", () => {
+		for (const raw of ["true", "yes", "2", "01"]) {
+			process.env.JUSTCLAW_DROP_REASONING_HISTORY = raw;
+			expect(() => resolveDropReasoningHistory()).toThrow(
+				'JUSTCLAW_DROP_REASONING_HISTORY must be "0" or "1"',
+			);
+		}
+	});
+});
+
+describe("dropReasoningItems", () => {
+	test("removes only reasoning items and preserves order", () => {
+		const history = [
+			{ role: "user", content: "a" },
+			{ type: "reasoning", content: [{ type: "reasoning_text", text: "r" }] },
+			{ role: "assistant", content: [{ type: "output_text", text: "b" }] },
+		] as unknown as AgentInputItem[];
+
+		expect(dropReasoningItems(history)).toEqual([
+			history[0],
+			history[2],
+		] as AgentInputItem[]);
+	});
+
+	test("leaves a history without reasoning untouched", () => {
+		const history = [{ role: "user", content: "a" }] as AgentInputItem[];
+		expect(dropReasoningItems(history)).toEqual(history);
 	});
 });
 
@@ -1124,6 +1177,110 @@ describe("runLlmLoop", () => {
 			role: "user",
 			content: "from-meta",
 		});
+	});
+
+	// Mirrors @openai/agents `getTurnInput`: the run's input verbatim, followed
+	// by the items the run generated.
+	function mockRunnerEchoing(
+		generated: AgentInputItem[],
+		capture: (input: unknown) => void,
+	): Runner {
+		return {
+			run: async (_agent: unknown, input: unknown) => {
+				capture(input);
+				const asList =
+					typeof input === "string"
+						? [{ type: "message", role: "user", content: input }]
+						: (input as AgentInputItem[]);
+				return { finalOutput: null, history: [...asList, ...generated] };
+			},
+		} as unknown as Runner;
+	}
+
+	const seededReasoning = {
+		type: "reasoning",
+		id: "rs_seeded",
+		content: [{ type: "reasoning_text", text: "past thinking" }],
+	} as unknown as AgentInputItem;
+
+	async function runWithSeededReasoning(): Promise<{
+		capturedInput: AgentInputItem[];
+		storedHistory: AgentInputItem[];
+	}> {
+		const home = await createTempDir("justclaw-llm-reasoning-");
+		const dbPath = path.join(home, "events.db");
+		const sessionStore = new SessionStore(path.join(home, "history"));
+		const sessionId = "01900000-0000-7000-8000-0000000000f1";
+		await sessionStore.save(sessionId, [
+			{ role: "user", content: "earlier" } as AgentInputItem,
+			seededReasoning,
+			{
+				role: "assistant",
+				status: "completed",
+				content: [{ type: "output_text", text: "earlier reply" }],
+			} as AgentInputItem,
+		]);
+		const queue = new EventQueue(dbPath);
+		queue.setMeta("active_session_id", sessionId);
+		queue.enqueue("srcmod", { type: "event.v1", kind: "test" });
+
+		let capturedInput: unknown;
+		const generatedReasoning = {
+			type: "reasoning",
+			id: "rs_new",
+			content: [{ type: "reasoning_text", text: "new thinking" }],
+		} as unknown as AgentInputItem;
+		const runner = mockRunnerEchoing([generatedReasoning], (input) => {
+			capturedInput = input;
+		});
+
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
+			runner,
+			sessionStore,
+		});
+		await waitForQueueEmpty(dbPath);
+		queue.close();
+		await loopTask;
+
+		const storedHistory = await sessionStore.load(sessionId);
+		if (storedHistory === null) {
+			throw new Error("session history missing after run");
+		}
+		return { capturedInput: capturedInput as AgentInputItem[], storedHistory };
+	}
+
+	test("keeps reasoning history in model input by default", async () => {
+		delete process.env.JUSTCLAW_DROP_REASONING_HISTORY;
+		const { capturedInput, storedHistory } = await runWithSeededReasoning();
+
+		expect(
+			capturedInput
+				.filter((i) => i.type === "reasoning")
+				.map((i) => (i as { id?: string }).id),
+		).toEqual(["rs_seeded"]);
+		expect(storedHistory.filter((i) => i.type === "reasoning").length).toBe(2);
+	});
+
+	test("JUSTCLAW_DROP_REASONING_HISTORY=1 strips reasoning from model input but keeps it on disk", async () => {
+		process.env.JUSTCLAW_DROP_REASONING_HISTORY = "1";
+		const { capturedInput, storedHistory } = await runWithSeededReasoning();
+
+		// The model never sees the previous event's reasoning...
+		expect(capturedInput.filter((i) => i.type === "reasoning")).toEqual([]);
+		expect(capturedInput.map((i) => i.type ?? "message")).toEqual([
+			"message",
+			"message",
+			"message",
+		]);
+
+		// ...but the persisted audit trail still has it, alongside the reasoning
+		// this run produced. Storing result.history directly would have dropped
+		// the seeded item here.
+		const storedReasoning = storedHistory.filter((i) => i.type === "reasoning");
+		expect(storedReasoning.length).toBe(2);
+		expect(storedReasoning[0]).toMatchObject({ id: "rs_seeded" });
+		expect(storedReasoning[1]).toMatchObject({ id: "rs_new" });
+		expect(storedHistory[0]).toMatchObject({ content: "earlier" });
 	});
 
 	test("falls back when meta active session id is invalid", async () => {

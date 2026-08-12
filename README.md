@@ -75,6 +75,7 @@ Type a message and press Enter. The LLM response is printed to the same terminal
 | `JUSTCLAW_CHARACTER` | no | `$JUSTCLAW_HOME/character` | Override path for the character directory |
 | `JUSTCLAW_SKILLS` | no | `$JUSTCLAW_HOME/skills` | Override path for the skills directory |
 | `JUSTCLAW_MAX_TURNS` | no | `10` | Maximum agent turns (LLM call to tool calls to repeat) per event before the runner gives up. Positive integer |
+| `JUSTCLAW_DROP_REASONING_HISTORY` | no | `0` | `1` strips reasoning items carried over from previous events before sending the session history to the model. Reasoning generated within the current event is unaffected, and the history file on disk keeps every reasoning item either way. See [Reasoning in session history](docs/spec.md#reasoning-in-session-history) |
 | `JUSTCLAW_MAX_RESTART_ATTEMPTS` | no | `1` | Maximum automatic restarts for a daemon that exits unexpectedly. Non-negative integer (`0` disables restart) |
 | `JUSTCLAW_SANDBOX_RO_PATHS` | no | — | Colon-separated absolute paths mounted read-only into the module sandbox and the workspace sandbox |
 | `JUSTCLAW_SANDBOX_RW_PATHS` | no | — | Colon-separated absolute paths mounted read-write into the module sandbox and the workspace sandbox (reachable by the LLM via the workspace sandbox) |
