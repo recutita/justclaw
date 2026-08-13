@@ -18,15 +18,32 @@ function interpolate(template: string, values: Record<string, string>): string {
 	return out;
 }
 
-export function buildRuntimeInstructions(
-	workspaceDir: string,
-	historyDir: string,
-	characterDir: string,
-	modulesRoot: string,
-	modules: Array<{ name: string; replyable: boolean; tools: string[] }>,
-	skillsDir?: string,
-	skills?: Array<{ name: string; description: string }>,
-): string {
+export type RuntimeInstructionsOptions = {
+	workspaceDir: string;
+	historyDir: string;
+	characterDir: string;
+	modulesRoot: string;
+	modules: Array<{ name: string; replyable: boolean; tools: string[] }>;
+	// Names of the built-in tools actually handed to the model this turn. Passed
+	// in rather than listed in the template because the set is not fixed: the
+	// attach_* tools are omitted when the provider cannot take that input
+	// modality, and a prompt that advertises a tool the model cannot call is
+	// worse than no listing at all.
+	builtinTools: string[];
+	skillsDir?: string;
+	skills?: Array<{ name: string; description: string }>;
+};
+
+export function buildRuntimeInstructions({
+	workspaceDir,
+	historyDir,
+	characterDir,
+	modulesRoot,
+	modules,
+	builtinTools,
+	skillsDir,
+	skills,
+}: RuntimeInstructionsOptions): string {
 	const moduleTable = modules
 		.map(
 			(m) =>
@@ -43,6 +60,7 @@ export function buildRuntimeInstructions(
 		CHARACTER_DIR: characterDir,
 		MODULES_ROOT: modulesRoot,
 		MODULE_TABLE: moduleTable,
+		BUILTIN_TOOLS: builtinTools.length > 0 ? builtinTools.join(", ") : "none",
 		SKILLS_SECTION: buildSkillsSection(skillsDir, skills),
 	});
 	return `<runtime>\n${body}\n</runtime>`;

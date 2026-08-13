@@ -83,8 +83,8 @@ For `tool/{name}` responses, the top-level `result.type` field is reserved by th
 |---|---|
 | omitted | The whole `result` is converted with `JSON.stringify(result)` and passed to the LLM as text. This is the backwards-compatible default. |
 | `json` | `result.data` is converted with `JSON.stringify(result.data)` when present; otherwise the whole `result` is stringified. |
-| `image` | `result.image.data` is treated as base64 image bytes and downscaled by the same image ingestion rule used for `image.send.v1`. In Responses mode it is passed to the LLM as an image tool result; in Chat Completions mode it is queued as `image.send.v1` for the next LLM cycle and the current tool result is text metadata. |
-| `file` | `result.file.data` is treated as base64 file bytes. In Responses mode it is passed to the LLM as a file tool result; in Chat Completions mode it is queued as `file.send.v1` for the next LLM cycle and the current tool result is text metadata. |
+| `image` | `result.image.data` is treated as base64 image bytes and downscaled by the same image ingestion rule used for `image.send.v1`. In Responses mode it is passed to the LLM as an image tool result; in Chat Completions mode it is queued as `image.send.v1` for the next LLM cycle and the current tool result is text metadata. Metadata only when the `image` modality is disabled (see [Input Modalities](#input-modalities)). |
+| `file` | `result.file.data` is treated as base64 file bytes. In Responses mode it is passed to the LLM as a file tool result; in Chat Completions mode it is queued as `file.send.v1` for the next LLM cycle and the current tool result is text metadata. Metadata only when the `file` modality is disabled (see [Input Modalities](#input-modalities)). |
 | anything else | The whole `result` is converted with `JSON.stringify(result)`. |
 
 Image and file results may include `mediaType`, `filename` (files), and `link`. The core records metadata for media tool results: `type`, `filename` when present, `mediaType`, `size`, `sha256`, `link` when present, and `attachable`. `attachable` is true only when `link` names a readable regular file on the host at the time the result is processed.
@@ -158,6 +158,22 @@ Emitted by a module to attach audio bytes on the next dequeue. Params:
 | `data` | string | Base64-encoded audio bytes |
 | `mediaType` | string | MIME type (for example `audio/wav`) |
 | `format` | string | Audio format for Chat Completions input. Use `wav` or `mp3`. |
+
+## Input Modalities
+
+OpenAI-compatible endpoints implement multimodal input unevenly, and independently of the API mode: vLLM, for example, accepts `input_image` and `input_audio` but rejects `input_file` on both `/v1/chat/completions` and `/v1/responses`. An unsupported content part comes back as a `400`, which fails the whole LLM cycle and drops the event. The core cannot probe capability, so the accepted set is operator configuration.
+
+`JUSTCLAW_OPENAI_INPUT_MODALITIES` is a comma-separated list of `image`, `file`, and `audio`, or the literal `none`. Unset or empty means all three. Any other value fails at startup.
+
+A disabled modality changes three things:
+
+| Path | Behavior when the modality is disabled |
+|---|---|
+| `image.send.v1` / `file.send.v1` / `audio.send.v1` events | The event is still processed. Only the XML wrapper is sent, as it is for `event.v1` — the descriptive fields (`mediaType`, `filename`, `format`) reach the LLM, the bytes do not. No media content part is built. |
+| Module tool results with `result.type` of `image` or `file` | The tool result becomes metadata plus `unsupported: true`. The bytes are not sent, and nothing is queued for the next cycle (that cycle would build the same rejected content part). |
+| `attach_image` / `attach_file` | Not exposed to the LLM at all, and not listed in the runtime instructions. Their only purpose is to place bytes in front of the model, so a version that can never succeed would waste turns. |
+
+Modules are unaffected: they may emit any envelope regardless of this setting, and no `event.dropped.v1` is produced by a disabled modality.
 
 ## Module → Core Session Requests
 
@@ -608,7 +624,9 @@ The bundled LLM loop rebuilds the agent `instructions` string immediately before
 | Part | Source | Content |
 |---|---|---|
 | Context instructions | Operator `AGENTS.md` and character files on disk (`SOUL.md`, etc.) | Each file fenced in its own XML element, as described under [Operator instructions](#operator-instructions) and [Character files](#character-files). Re-loaded before each LLM turn when `characterDir` is configured. Empty when no files are present or all trim empty. |
-| Runtime instructions | `buildRuntimeInstructions` | Canonical paths and operational guidance (workspace, history layout, character files table, modules directory path, table of loaded modules with replyable flag and tool names, and skill index when a skills directory is configured), fenced in a `<runtime>` element. Inner prose is Markdown; only the boundary is XML. |
+| Runtime instructions | `buildRuntimeInstructions` | Canonical paths and operational guidance (workspace, history layout, character files table, modules directory path, table of loaded modules with replyable flag and tool names, the built-in tool list, and skill index when a skills directory is configured), fenced in a `<runtime>` element. Inner prose is Markdown; only the boundary is XML. |
+
+The built-in tool list is derived from the tools actually handed to the model for that turn, so it cannot advertise a tool the model does not have (see [Input Modalities](#input-modalities)).
 
 The core concatenates context instructions and runtime instructions with a **blank line** between them (`\n\n`). Each part is fenced in XML elements (`<system-instructions>`, the per-file character tags, and `<runtime>`) so the model can tell operator instructions, editable character content, and machine-supplied runtime facts apart. Runtime instructions are omitted unless the builder has the workspace path, history path, character path, modules directory path, and the current module list (the bundled entrypoint supplies all of these). Callers without a `characterDir` may still supply static context instructions (tests only in-tree).
 
@@ -817,6 +835,8 @@ attach_image({ path: string })
 
 The file is read through the workspace sandbox, so the path must be within a sandbox-accessible directory (workspace, character, modules, history, or the standard OS read-only paths). The core infers a `mediaType` from the extension and downscales large images before re-encoding them. In Responses mode the image is returned as the tool result so it is available to the LLM in the same turn; in Chat Completions mode it is queued as `image.send.v1` for the next LLM cycle. On failure it returns `error: ...`.
 
+This tool is not exposed when the `image` modality is disabled (see [Input Modalities](#input-modalities)).
+
 ### Built-in Tool: `attach_file`
 
 ```
@@ -828,6 +848,8 @@ attach_file({ path: string })
 | `path` | Path to a file accessible within the workspace sandbox |
 
 The file is read through the workspace sandbox, so the path must be within a sandbox-accessible directory (workspace, character, modules, history, or the standard OS read-only paths). The core infers `mediaType` from the extension and sets `filename` to the basename. In Responses mode the file is returned as the tool result so it is available to the LLM in the same turn; in Chat Completions mode it is queued as `file.send.v1` for the next LLM cycle. On failure it returns `error: ...`.
+
+This tool is not exposed when the `file` modality is disabled (see [Input Modalities](#input-modalities)).
 
 ### Built-in Tool: `shell`
 
@@ -905,7 +927,7 @@ Use this when the task is complete and no reply is needed — for example after 
 
 Event payloads are arbitrary JSON objects. The canonical text-oriented envelope is `type: "event.v1"`. The core uses `type` for envelope handling and does not forward that field to the LLM as a literal key in the user string. The remaining payload fields are converted to XML before passing them to the LLM. Many LLMs handle XML-tagged input better than raw JSON, producing more reliable reasoning.
 
-**Multimodal envelopes (`image.send.v1`, `file.send.v1`, `audio.send.v1`):** The core builds the XML wrapper (`eventToXml`) from the payload with both `type` and the base64 `data` stripped, and passes it as an `input_text` part — so fields such as `mediaType`, `filename`, and `format` reach the LLM as text, but the bytes do not. The bytes go in a second content part: `input_image`, `input_file`, or `audio`. Image and file content use a **data URL string** (`data:<mediaType>;base64,<data>`), matching the Chat Completions path. Audio content uses inline base64 plus `format` (`wav` or `mp3`) so the OpenAI adapter can build `input_audio`. `data` is kept out of the XML so the bytes are not sent twice; the text copy would exhaust the context window. These rows are processed in the same session-adoption path as `event.v1`.
+**Multimodal envelopes (`image.send.v1`, `file.send.v1`, `audio.send.v1`):** The core builds the XML wrapper (`eventToXml`) from the payload with both `type` and the base64 `data` stripped, and passes it as an `input_text` part — so fields such as `mediaType`, `filename`, and `format` reach the LLM as text, but the bytes do not. The bytes go in a second content part: `input_image`, `input_file`, or `audio`. Image and file content use a **data URL string** (`data:<mediaType>;base64,<data>`), matching the Chat Completions path. Audio content uses inline base64 plus `format` (`wav` or `mp3`) so the OpenAI adapter can build `input_audio`. `data` is kept out of the XML so the bytes are not sent twice; the text copy would exhaust the context window. These rows are processed in the same session-adoption path as `event.v1`. When the corresponding modality is disabled, the second content part is omitted and only the XML text part is sent (see [Input Modalities](#input-modalities)).
 
 **Conversion rules (for the XML half):**
 

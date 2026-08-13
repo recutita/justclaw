@@ -4,22 +4,39 @@ import { buildSystemPrompt } from "./system-prompt";
 
 describe("buildRuntimeInstructions", () => {
 	test("embeds workspace, history, character, and modules paths", () => {
-		const text = buildRuntimeInstructions(
-			"/tmp/ws",
-			"/tmp/hist",
-			"/tmp/ch",
-			"/tmp/mods",
-			[
+		const text = buildRuntimeInstructions({
+			workspaceDir: "/tmp/ws",
+			historyDir: "/tmp/hist",
+			characterDir: "/tmp/ch",
+			modulesRoot: "/tmp/mods",
+			modules: [
 				{ name: "cli-chat", replyable: true, tools: ["send"] },
 				{ name: "watcher", replyable: false, tools: [] },
 			],
-		);
+			builtinTools: ["route_message", "turn_end"],
+		});
 		expect(text).toContain("Path: /tmp/ws");
 		expect(text).toContain("Path: /tmp/hist");
 		expect(text).toContain("Path: /tmp/ch");
 		expect(text).toContain("Modules directory: /tmp/mods");
 		expect(text).toContain("| cli-chat | yes | send |");
 		expect(text).toContain("| watcher | no | — |");
+	});
+
+	test("lists only the built-in tools it is given", () => {
+		const text = buildRuntimeInstructions({
+			workspaceDir: "/tmp/ws",
+			historyDir: "/tmp/hist",
+			characterDir: "/tmp/ch",
+			modulesRoot: "/tmp/mods",
+			modules: [],
+			builtinTools: ["route_message", "restart_modules", "turn_end"],
+		});
+		expect(text).toContain(
+			"Built-in tools: route_message, restart_modules, turn_end.",
+		);
+		expect(text).not.toContain("attach_image");
+		expect(text).not.toContain("attach_file");
 	});
 });
 
@@ -51,9 +68,17 @@ describe("buildSystemPrompt", () => {
 				characterDir: "/c",
 				modulesRoot: "/m",
 				modules,
+				builtinTools: ["turn_end"],
 			}),
 		).toBe(
-			`alpha\n\n${buildRuntimeInstructions("/w", "/h", "/c", "/m", modules)}`,
+			`alpha\n\n${buildRuntimeInstructions({
+				workspaceDir: "/w",
+				historyDir: "/h",
+				characterDir: "/c",
+				modulesRoot: "/m",
+				modules,
+				builtinTools: ["turn_end"],
+			})}`,
 		);
 	});
 
