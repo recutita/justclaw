@@ -12,6 +12,7 @@ import {
 	downscaleImage,
 	dropReasoningItems,
 	resolveDropReasoningHistory,
+	resolveInputModalities,
 	runLlmLoop,
 	sanitizeHistoryForStorage,
 } from "./llm-loop";
@@ -29,6 +30,7 @@ const hasSandbox =
 const tempDirs: string[] = [];
 const originalOpenAIAPI = process.env.JUSTCLAW_OPENAI_API;
 const originalDropReasoning = process.env.JUSTCLAW_DROP_REASONING_HISTORY;
+const originalInputModalities = process.env.JUSTCLAW_OPENAI_INPUT_MODALITIES;
 
 afterEach(async () => {
 	if (originalOpenAIAPI === undefined) {
@@ -40,6 +42,11 @@ afterEach(async () => {
 		delete process.env.JUSTCLAW_DROP_REASONING_HISTORY;
 	} else {
 		process.env.JUSTCLAW_DROP_REASONING_HISTORY = originalDropReasoning;
+	}
+	if (originalInputModalities === undefined) {
+		delete process.env.JUSTCLAW_OPENAI_INPUT_MODALITIES;
+	} else {
+		process.env.JUSTCLAW_OPENAI_INPUT_MODALITIES = originalInputModalities;
 	}
 	while (tempDirs.length > 0) {
 		const dir = tempDirs.pop();
@@ -347,6 +354,44 @@ describe("dropReasoningItems", () => {
 	});
 });
 
+describe("resolveInputModalities", () => {
+	test("defaults to every modality when unset or empty", () => {
+		delete process.env.JUSTCLAW_OPENAI_INPUT_MODALITIES;
+		expect([...resolveInputModalities()].sort()).toEqual([
+			"audio",
+			"file",
+			"image",
+		]);
+		process.env.JUSTCLAW_OPENAI_INPUT_MODALITIES = "  ";
+		expect(resolveInputModalities().size).toBe(3);
+	});
+
+	test("parses a comma-separated subset", () => {
+		process.env.JUSTCLAW_OPENAI_INPUT_MODALITIES = "image, audio";
+		const modalities = resolveInputModalities();
+		expect(modalities.has("image")).toBe(true);
+		expect(modalities.has("audio")).toBe(true);
+		expect(modalities.has("file")).toBe(false);
+	});
+
+	test('"none" disables every modality', () => {
+		process.env.JUSTCLAW_OPENAI_INPUT_MODALITIES = "none";
+		expect(resolveInputModalities().size).toBe(0);
+	});
+
+	test("rejects an unknown modality", () => {
+		process.env.JUSTCLAW_OPENAI_INPUT_MODALITIES = "image,video";
+		expect(() => resolveInputModalities()).toThrow(
+			/JUSTCLAW_OPENAI_INPUT_MODALITIES/,
+		);
+	});
+
+	test("rejects a value that names no modality", () => {
+		process.env.JUSTCLAW_OPENAI_INPUT_MODALITIES = ",,";
+		expect(() => resolveInputModalities()).toThrow(/use "none"/);
+	});
+});
+
 describe("runLlmLoop", () => {
 	test("sessions.switch.v1 is skipped with event.dropped when target file missing at apply time", async () => {
 		const home = await createTempDir("justclaw-llm-switch-missing-");
@@ -422,7 +467,20 @@ describe("runLlmLoop", () => {
 		await loopTask;
 
 		expect(capturedAgent?.instructions).toBe(
-			`<AGENTS.md>\nCONTEXT_BLOCK\n</AGENTS.md>\n\n${buildRuntimeInstructions("/tmp/ws", "/tmp/hist", characterDir, "/tmp/mods", [])}`,
+			`<AGENTS.md>\nCONTEXT_BLOCK\n</AGENTS.md>\n\n${buildRuntimeInstructions({
+				workspaceDir: "/tmp/ws",
+				historyDir: "/tmp/hist",
+				characterDir,
+				modulesRoot: "/tmp/mods",
+				modules: [],
+				builtinTools: [
+					"route_message",
+					"restart_modules",
+					"turn_end",
+					"attach_image",
+					"attach_file",
+				],
+			})}`,
 		);
 	});
 
@@ -521,6 +579,78 @@ describe("runLlmLoop", () => {
 			audio: audioData,
 			format: "wav",
 		});
+	});
+
+	test("sends a disabled modality as text only, without the media part", async () => {
+		process.env.JUSTCLAW_OPENAI_INPUT_MODALITIES = "image";
+		const fileData = Buffer.from("%PDF-1.4").toString("base64");
+		const home = await createTempDir("justclaw-llm-modality-");
+		const dbPath = path.join(home, "events.db");
+		const queue = new EventQueue(dbPath);
+		queue.enqueue("srcmod", {
+			type: "file.send.v1",
+			data: fileData,
+			mediaType: "application/pdf",
+			filename: "report.pdf",
+		});
+
+		let capturedInput: unknown;
+		const mockRunner = {
+			run: async (_agent: unknown, input: unknown) => {
+				capturedInput = input;
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
+			runner: mockRunner,
+		});
+		await waitForQueueEmpty(dbPath);
+		queue.close();
+		await loopTask;
+
+		const inputArr = capturedInput as AgentInputItem[];
+		const userInput = inputArr[0] as { content: unknown };
+		// The descriptive fields survive so the model knows what it could not see.
+		expect(typeof userInput.content).toBe("string");
+		expect(userInput.content as string).toContain(
+			"<filename>report.pdf</filename>",
+		);
+		expect(userInput.content as string).not.toContain(fileData);
+	});
+
+	test("omits attach_file from the agent tools when file input is disabled", async () => {
+		process.env.JUSTCLAW_OPENAI_INPUT_MODALITIES = "image,audio";
+		const home = await createTempDir("justclaw-llm-attach-omit-");
+		const dbPath = path.join(home, "events.db");
+		const queue = new EventQueue(dbPath);
+		queue.enqueue("srcmod", { type: "event.v1", kind: "ping" });
+
+		let toolNames: string[] = [];
+		let instructions: unknown;
+		const mockRunner = {
+			run: async (agent: Agent) => {
+				toolNames = (agent.tools ?? []).map((t) => t.name);
+				instructions = agent.instructions;
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
+			runner: mockRunner,
+			workspaceDir: "/tmp/ws",
+			historyDir: "/tmp/hist",
+			characterDir: home,
+			modulesRoot: "/tmp/mods",
+		});
+		await waitForQueueEmpty(dbPath);
+		queue.close();
+		await loopTask;
+
+		expect(toolNames).toContain("attach_image");
+		expect(toolNames).not.toContain("attach_file");
+		expect(instructions as string).toContain("attach_image");
+		expect(instructions as string).not.toContain("attach_file");
 	});
 
 	test.skipIf(!hasSandbox)(

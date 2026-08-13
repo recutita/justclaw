@@ -7,6 +7,7 @@ export function buildSystemPrompt(options: {
 	characterDir?: string;
 	modulesRoot?: string;
 	modules?: Array<{ name: string; replyable: boolean; tools: string[] }>;
+	builtinTools?: string[];
 	skillsDir?: string;
 	skills?: Array<{ name: string; description: string }>;
 }): string {
@@ -15,16 +16,18 @@ export function buildSystemPrompt(options: {
 		options.historyDir !== undefined &&
 		options.characterDir !== undefined &&
 		options.modulesRoot !== undefined &&
-		options.modules !== undefined
-			? buildRuntimeInstructions(
-					options.workspaceDir,
-					options.historyDir,
-					options.characterDir,
-					options.modulesRoot,
-					options.modules,
-					options.skillsDir,
-					options.skills,
-				)
+		options.modules !== undefined &&
+		options.builtinTools !== undefined
+			? buildRuntimeInstructions({
+					workspaceDir: options.workspaceDir,
+					historyDir: options.historyDir,
+					characterDir: options.characterDir,
+					modulesRoot: options.modulesRoot,
+					modules: options.modules,
+					builtinTools: options.builtinTools,
+					skillsDir: options.skillsDir,
+					skills: options.skills,
+				})
 			: undefined;
 	return [options.contextInstructions, runtimeBlock]
 		.filter((s) => s !== undefined && s !== "")

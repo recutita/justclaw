@@ -70,6 +70,7 @@ Type a message and press Enter. The LLM response is printed to the same terminal
 | `JUSTCLAW_OPENAI_API_KEY` | yes | — | API key passed to the OpenAI-compatible client |
 | `JUSTCLAW_OPENAI_MODEL` | yes | — | Model name, e.g. `gpt-5` |
 | `JUSTCLAW_OPENAI_API` | no | `chat_completions` | OpenAI API mode: `chat_completions` or `responses`. Use `responses` for multimodal tool results; compatible providers must support `/v1/responses` |
+| `JUSTCLAW_OPENAI_INPUT_MODALITIES` | no | `image,file,audio` | Comma-separated list of multimodal input kinds the endpoint accepts (`image`, `file`, `audio`), or `none`. Bytes of a disabled kind are never sent, and `attach_image` / `attach_file` are not exposed to the LLM when their kind is disabled |
 | `JUSTCLAW_OPENAI_BASE_URL` | no | OpenAI default | Base URL for the API endpoint; set to use a compatible provider |
 | `JUSTCLAW_HOME` | no | `$HOME/justclaw` | Root directory for modules, workspace, history, character, and skills |
 | `JUSTCLAW_CHARACTER` | no | `$JUSTCLAW_HOME/character` | Override path for the character directory |

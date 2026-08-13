@@ -44,7 +44,7 @@ Modules directory: {{MODULES_ROOT}}
 
 Module tools are called as {module}__{tool}.
 
-Built-in tools: route_message, restart_modules, turn_end, attach_image, attach_file. See each tool's own description for usage.
+Built-in tools: {{BUILTIN_TOOLS}}. See each tool's own description for usage.
 
 {{SKILLS_SECTION}}
 

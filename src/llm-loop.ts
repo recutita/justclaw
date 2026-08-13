@@ -49,10 +49,55 @@ type MediaEventParams = {
 	size?: number;
 	sha256?: string;
 };
+export type InputModality = "image" | "file" | "audio";
+
+const ALL_INPUT_MODALITIES: InputModality[] = ["image", "file", "audio"];
+
 type ToolResultDelivery = {
 	apiMode: OpenAIAPIMode;
+	inputModalities: ReadonlySet<InputModality>;
 	enqueueMedia: (params: MediaEventParams) => void;
 };
+
+// Which multimodal input parts the configured endpoint accepts. OpenAI-compatible
+// providers implement these unevenly and independently of the API mode — vLLM,
+// for example, takes input_image and input_audio but rejects input_file on both
+// /v1/chat/completions and /v1/responses. An unsupported part comes back as a
+// hard 400 that drops the whole event, so the modality set has to be operator
+// configuration: the core cannot probe capability, and the API-mode switch does
+// not describe it.
+export function resolveInputModalities(): ReadonlySet<InputModality> {
+	const raw = process.env.JUSTCLAW_OPENAI_INPUT_MODALITIES;
+	if (raw === undefined || raw.trim() === "") {
+		return new Set(ALL_INPUT_MODALITIES);
+	}
+	// Explicit sentinel for a text-only provider. Without it that case is
+	// inexpressible, because an empty value reads as "unset" above.
+	if (raw.trim() === "none") {
+		return new Set<InputModality>();
+	}
+	const modalities = new Set<InputModality>();
+	for (const entry of raw.split(",")) {
+		const name = entry.trim();
+		if (
+			name !== "image" &&
+			name !== "file" &&
+			name !== "audio" &&
+			name !== ""
+		) {
+			throw new Error(
+				`JUSTCLAW_OPENAI_INPUT_MODALITIES must be "none" or a comma-separated list of image, file, audio, got ${JSON.stringify(raw)}`,
+			);
+		}
+		if (name !== "") modalities.add(name);
+	}
+	if (modalities.size === 0) {
+		throw new Error(
+			`JUSTCLAW_OPENAI_INPUT_MODALITIES names no modality; use "none" to disable all, got ${JSON.stringify(raw)}`,
+		);
+	}
+	return modalities;
+}
 
 function resolveOpenAIAPIMode(): OpenAIAPIMode {
 	const api = process.env.JUSTCLAW_OPENAI_API ?? "chat_completions";
@@ -517,7 +562,9 @@ function mediaEventFromToolResult(
 	return null;
 }
 
-function delayedMediaToolOutput(result: Record<string, unknown>): string {
+function mediaToolMetadata(
+	result: Record<string, unknown>,
+): Record<string, unknown> {
 	const media =
 		result.type === "image" && isRecord(result.image)
 			? result.image
@@ -525,12 +572,26 @@ function delayedMediaToolOutput(result: Record<string, unknown>): string {
 				? result.file
 				: {};
 	const { data: _data, ...metadata } = media;
+	return metadata;
+}
+
+function delayedMediaToolOutput(result: Record<string, unknown>): string {
 	return JSON.stringify({
 		type: result.type,
 		delayed: true,
 		message:
 			"Media was queued as a multimodal event and will be available in the next LLM cycle.",
-		[result.type === "file" ? "file" : "image"]: metadata,
+		[result.type === "file" ? "file" : "image"]: mediaToolMetadata(result),
+	});
+}
+
+function unsupportedMediaToolOutput(result: Record<string, unknown>): string {
+	return JSON.stringify({
+		type: result.type,
+		unsupported: true,
+		message:
+			"The configured model endpoint does not accept this input modality, so the bytes were not sent. Only the metadata below is available.",
+		[result.type === "file" ? "file" : "image"]: mediaToolMetadata(result),
 	});
 }
 
@@ -538,11 +599,20 @@ function maybeDelayMediaToolResult(
 	result: Record<string, unknown>,
 	delivery?: ToolResultDelivery,
 ): unknown {
-	if (delivery?.apiMode !== "chat_completions") {
+	if (!delivery) {
 		return result;
 	}
 	const event = mediaEventFromToolResult(result);
 	if (!event) {
+		return result;
+	}
+	const modality = event.type === "image.send.v1" ? "image" : "file";
+	if (!delivery.inputModalities.has(modality)) {
+		// Not enqueued as a media event either: the next cycle would build the
+		// same rejected content part and drop that event too.
+		return unsupportedMediaToolOutput(result);
+	}
+	if (delivery.apiMode !== "chat_completions") {
 		return result;
 	}
 	delivery.enqueueMedia(event);
@@ -1047,6 +1117,7 @@ export async function runLlmLoop(
 	const runner = options?.runner ?? new Runner({ tracingDisabled: true });
 	const maxTurns = resolveMaxTurns();
 	const dropReasoningHistory = resolveDropReasoningHistory();
+	const inputModalities = resolveInputModalities();
 	const sessionStore = options?.sessionStore;
 	const baseAgent = new Agent({
 		name: "justclaw",
@@ -1245,6 +1316,7 @@ export async function runLlmLoop(
 		const openAIAPIMode = resolveOpenAIAPIMode();
 		const toolResultDelivery: ToolResultDelivery = {
 			apiMode: openAIAPIMode,
+			inputModalities,
 			enqueueMedia: (params) => {
 				eventQueue.enqueue(event.source, params);
 			},
@@ -1275,154 +1347,166 @@ export async function runLlmLoop(
 				strict: true,
 				execute: async () => "ok",
 			}),
-			tool({
-				name: "attach_image",
-				description:
-					"Read a local image file and attach it to the LLM input. " +
-					"In Responses mode it is available in this turn; in Chat Completions mode it arrives in the next cycle. " +
-					"The path must be within a sandbox-accessible directory (workspace, character, modules, skills, history, or standard OS read-only paths).",
-				parameters: {
-					type: "object",
-					properties: {
-						path: {
-							type: "string",
-							description: "Path to the image file",
-						},
-					},
-					required: ["path"],
-					additionalProperties: false,
-				},
-				strict: true,
-				execute: async (input: unknown) => {
-					if (
-						options === undefined ||
-						options.workspaceDir === undefined ||
-						options.workspaceDir === ""
-					) {
-						return "error: workspace not configured";
-					}
-					const {
-						workspaceDir,
-						historyDir: historyDirOpt,
-						characterDir,
-						modulesRoot,
-						skillsDir,
-					} = options;
-					const historyDir = historyDirOpt ?? workspaceDir;
-					const { path: pathArg } = input as { path: string };
-					const resolved = path.resolve(pathArg);
-					const read = await runReadFileBase64(
-						workspaceDir,
-						historyDir,
-						process.platform,
-						resolved,
-						characterDir,
-						modulesRoot,
-						skillsDir,
-					);
-					if (!read.ok) {
-						return `error: ${read.stderr.trim() || "read failed"}`;
-					}
-					const mediaType = inferImageMediaType(resolved);
-					const original = Buffer.from(read.content, "base64");
-					const image = await downscaleImage(original, mediaType);
-					const metadata = await buildMediaMetadata(
-						"image",
-						image.data,
-						image.mediaType,
-						resolved,
-					);
-					return prepareToolResultForLlm(
-						{
-							type: "image",
-							image: {
-								data: Buffer.from(image.data).toString("base64"),
-								mediaType: image.mediaType,
-								size: metadata.size,
-								sha256: metadata.sha256,
-								link: resolved,
+			// The attach_* tools exist only to put bytes in front of the model. When
+			// the endpoint cannot take that modality they are omitted rather than
+			// left to return an error: a tool the model can call but never succeed
+			// with just burns turns and confuses it.
+			...(inputModalities.has("image")
+				? [
+						tool({
+							name: "attach_image",
+							description:
+								"Read a local image file and attach it to the LLM input. " +
+								"In Responses mode it is available in this turn; in Chat Completions mode it arrives in the next cycle. " +
+								"The path must be within a sandbox-accessible directory (workspace, character, modules, skills, history, or standard OS read-only paths).",
+							parameters: {
+								type: "object",
+								properties: {
+									path: {
+										type: "string",
+										description: "Path to the image file",
+									},
+								},
+								required: ["path"],
+								additionalProperties: false,
 							},
-							providerData: attachProviderMetadata(undefined, metadata),
-						},
-						toolResultDelivery,
-					);
-				},
-			}),
-			tool({
-				name: "attach_file",
-				description:
-					"Read a local file and attach it to the LLM input. " +
-					"In Responses mode it is available in this turn; in Chat Completions mode it arrives in the next cycle. " +
-					"The path must be within a sandbox-accessible directory (workspace, character, modules, skills, history, or standard OS read-only paths).",
-				parameters: {
-					type: "object",
-					properties: {
-						path: {
-							type: "string",
-							description: "Path to the file",
-						},
-					},
-					required: ["path"],
-					additionalProperties: false,
-				},
-				strict: true,
-				execute: async (input: unknown) => {
-					if (
-						options === undefined ||
-						options.workspaceDir === undefined ||
-						options.workspaceDir === ""
-					) {
-						return "error: workspace not configured";
-					}
-					const {
-						workspaceDir,
-						historyDir: historyDirOpt,
-						characterDir,
-						modulesRoot,
-						skillsDir,
-					} = options;
-					const historyDir = historyDirOpt ?? workspaceDir;
-					const { path: pathArg } = input as { path: string };
-					const resolved = path.resolve(pathArg);
-					const read = await runReadFileBase64(
-						workspaceDir,
-						historyDir,
-						process.platform,
-						resolved,
-						characterDir,
-						modulesRoot,
-						skillsDir,
-					);
-					if (!read.ok) {
-						return `error: ${read.stderr.trim() || "read failed"}`;
-					}
-					const mediaType = inferFileMediaType(resolved);
-					const filename = path.basename(resolved);
-					const bytes = Buffer.from(read.content, "base64");
-					const metadata = await buildMediaMetadata(
-						"file",
-						bytes,
-						mediaType,
-						resolved,
-						filename,
-					);
-					return prepareToolResultForLlm(
-						{
-							type: "file",
-							file: {
-								data: read.content,
-								mediaType,
-								filename,
-								size: metadata.size,
-								sha256: metadata.sha256,
-								link: resolved,
+							strict: true,
+							execute: async (input: unknown) => {
+								if (
+									options === undefined ||
+									options.workspaceDir === undefined ||
+									options.workspaceDir === ""
+								) {
+									return "error: workspace not configured";
+								}
+								const {
+									workspaceDir,
+									historyDir: historyDirOpt,
+									characterDir,
+									modulesRoot,
+									skillsDir,
+								} = options;
+								const historyDir = historyDirOpt ?? workspaceDir;
+								const { path: pathArg } = input as { path: string };
+								const resolved = path.resolve(pathArg);
+								const read = await runReadFileBase64(
+									workspaceDir,
+									historyDir,
+									process.platform,
+									resolved,
+									characterDir,
+									modulesRoot,
+									skillsDir,
+								);
+								if (!read.ok) {
+									return `error: ${read.stderr.trim() || "read failed"}`;
+								}
+								const mediaType = inferImageMediaType(resolved);
+								const original = Buffer.from(read.content, "base64");
+								const image = await downscaleImage(original, mediaType);
+								const metadata = await buildMediaMetadata(
+									"image",
+									image.data,
+									image.mediaType,
+									resolved,
+								);
+								return prepareToolResultForLlm(
+									{
+										type: "image",
+										image: {
+											data: Buffer.from(image.data).toString("base64"),
+											mediaType: image.mediaType,
+											size: metadata.size,
+											sha256: metadata.sha256,
+											link: resolved,
+										},
+										providerData: attachProviderMetadata(undefined, metadata),
+									},
+									toolResultDelivery,
+								);
 							},
-							providerData: attachProviderMetadata(undefined, metadata),
-						},
-						toolResultDelivery,
-					);
-				},
-			}),
+						}),
+					]
+				: []),
+			...(inputModalities.has("file")
+				? [
+						tool({
+							name: "attach_file",
+							description:
+								"Read a local file and attach it to the LLM input. " +
+								"In Responses mode it is available in this turn; in Chat Completions mode it arrives in the next cycle. " +
+								"The path must be within a sandbox-accessible directory (workspace, character, modules, skills, history, or standard OS read-only paths).",
+							parameters: {
+								type: "object",
+								properties: {
+									path: {
+										type: "string",
+										description: "Path to the file",
+									},
+								},
+								required: ["path"],
+								additionalProperties: false,
+							},
+							strict: true,
+							execute: async (input: unknown) => {
+								if (
+									options === undefined ||
+									options.workspaceDir === undefined ||
+									options.workspaceDir === ""
+								) {
+									return "error: workspace not configured";
+								}
+								const {
+									workspaceDir,
+									historyDir: historyDirOpt,
+									characterDir,
+									modulesRoot,
+									skillsDir,
+								} = options;
+								const historyDir = historyDirOpt ?? workspaceDir;
+								const { path: pathArg } = input as { path: string };
+								const resolved = path.resolve(pathArg);
+								const read = await runReadFileBase64(
+									workspaceDir,
+									historyDir,
+									process.platform,
+									resolved,
+									characterDir,
+									modulesRoot,
+									skillsDir,
+								);
+								if (!read.ok) {
+									return `error: ${read.stderr.trim() || "read failed"}`;
+								}
+								const mediaType = inferFileMediaType(resolved);
+								const filename = path.basename(resolved);
+								const bytes = Buffer.from(read.content, "base64");
+								const metadata = await buildMediaMetadata(
+									"file",
+									bytes,
+									mediaType,
+									resolved,
+									filename,
+								);
+								return prepareToolResultForLlm(
+									{
+										type: "file",
+										file: {
+											data: read.content,
+											mediaType,
+											filename,
+											size: metadata.size,
+											sha256: metadata.sha256,
+											link: resolved,
+										},
+										providerData: attachProviderMetadata(undefined, metadata),
+									},
+									toolResultDelivery,
+								);
+							},
+						}),
+					]
+				: []),
 		];
 
 		const tools: Tool[] = [
@@ -1474,6 +1558,9 @@ export async function runLlmLoop(
 			characterDir: options?.characterDir,
 			modulesRoot: options?.modulesRoot,
 			modules,
+			// Derived from the tools actually built above, so the prompt cannot
+			// drift from the live tool set.
+			builtinTools: coreTools.map((t) => t.name),
 			skillsDir: options?.skillsDir,
 			skills,
 		});
@@ -1529,10 +1616,17 @@ export async function runLlmLoop(
 			// Build the LLM input inside the try so an invalid payload (e.g. a
 			// key eventToXml rejects) is dropped like any other per-event failure
 			// instead of throwing out of runLlmLoop and killing the whole loop.
-			const eventForInput = await prepareImageEventForInput(event);
+			// A disabled modality falls through to the text-only branch below: the
+			// XML wrapper already excludes the base64 data and keeps the
+			// descriptive fields, so the model still learns that a file arrived
+			// and what it was, without a content part the endpoint would reject.
+			const eventForInput = inputModalities.has("image")
+				? await prepareImageEventForInput(event)
+				: event;
 			const xml = eventToXml(eventForInput);
 			const userInput: AgentInputItem =
-				eventForInput.params.type === "image.send.v1"
+				eventForInput.params.type === "image.send.v1" &&
+				inputModalities.has("image")
 					? ({
 							role: "user",
 							content: [
@@ -1543,7 +1637,8 @@ export async function runLlmLoop(
 								},
 							],
 						} as AgentInputItem)
-					: eventForInput.params.type === "file.send.v1"
+					: eventForInput.params.type === "file.send.v1" &&
+							inputModalities.has("file")
 						? ({
 								role: "user",
 								content: [
@@ -1557,7 +1652,8 @@ export async function runLlmLoop(
 									},
 								],
 							} as AgentInputItem)
-						: eventForInput.params.type === "audio.send.v1"
+						: eventForInput.params.type === "audio.send.v1" &&
+								inputModalities.has("audio")
 							? ({
 									role: "user",
 									content: [
