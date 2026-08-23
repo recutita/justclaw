@@ -23,8 +23,7 @@
 		"typescript": "^5"
 	},
 	"dependencies": {
-		"@openai/agents": "^0.8.3",
-		"@openai/agents-realtime": "^0.8.5",
-		"openai": "^6.34.0"
+		"@openai/agents": "^0.17.0",
+		"openai": "^7.5.0"
 	}
 }

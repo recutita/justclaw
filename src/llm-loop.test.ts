@@ -13,6 +13,8 @@ import {
 	dropReasoningItems,
 	resolveDropReasoningHistory,
 	resolveInputModalities,
+	resolveModelTimeoutMs,
+	resolveToolTimeoutMs,
 	runLlmLoop,
 	sanitizeHistoryForStorage,
 } from "./llm-loop";
@@ -31,6 +33,8 @@ const tempDirs: string[] = [];
 const originalOpenAIAPI = process.env.JUSTCLAW_OPENAI_API;
 const originalDropReasoning = process.env.JUSTCLAW_DROP_REASONING_HISTORY;
 const originalInputModalities = process.env.JUSTCLAW_OPENAI_INPUT_MODALITIES;
+const originalModelTimeout = process.env.JUSTCLAW_MODEL_TIMEOUT;
+const originalToolTimeout = process.env.JUSTCLAW_TOOL_TIMEOUT;
 
 afterEach(async () => {
 	if (originalOpenAIAPI === undefined) {
@@ -47,6 +51,16 @@ afterEach(async () => {
 		delete process.env.JUSTCLAW_OPENAI_INPUT_MODALITIES;
 	} else {
 		process.env.JUSTCLAW_OPENAI_INPUT_MODALITIES = originalInputModalities;
+	}
+	if (originalModelTimeout === undefined) {
+		delete process.env.JUSTCLAW_MODEL_TIMEOUT;
+	} else {
+		process.env.JUSTCLAW_MODEL_TIMEOUT = originalModelTimeout;
+	}
+	if (originalToolTimeout === undefined) {
+		delete process.env.JUSTCLAW_TOOL_TIMEOUT;
+	} else {
+		process.env.JUSTCLAW_TOOL_TIMEOUT = originalToolTimeout;
 	}
 	while (tempDirs.length > 0) {
 		const dir = tempDirs.pop();
@@ -329,6 +343,46 @@ describe("resolveDropReasoningHistory", () => {
 			process.env.JUSTCLAW_DROP_REASONING_HISTORY = raw;
 			expect(() => resolveDropReasoningHistory()).toThrow(
 				'JUSTCLAW_DROP_REASONING_HISTORY must be "0" or "1"',
+			);
+		}
+	});
+});
+
+describe("timeout resolvers", () => {
+	test("default to 10 minutes for the model and 60 seconds for module tools", () => {
+		delete process.env.JUSTCLAW_MODEL_TIMEOUT;
+		delete process.env.JUSTCLAW_TOOL_TIMEOUT;
+		expect(resolveModelTimeoutMs()).toBe(600_000);
+		expect(resolveToolTimeoutMs()).toBe(60_000);
+		process.env.JUSTCLAW_MODEL_TIMEOUT = "";
+		process.env.JUSTCLAW_TOOL_TIMEOUT = "";
+		expect(resolveModelTimeoutMs()).toBe(600_000);
+		expect(resolveToolTimeoutMs()).toBe(60_000);
+	});
+
+	test("read whole seconds and convert to milliseconds", () => {
+		process.env.JUSTCLAW_MODEL_TIMEOUT = "90";
+		process.env.JUSTCLAW_TOOL_TIMEOUT = "5";
+		expect(resolveModelTimeoutMs()).toBe(90_000);
+		expect(resolveToolTimeoutMs()).toBe(5_000);
+	});
+
+	test("treat 0 as no bound", () => {
+		process.env.JUSTCLAW_MODEL_TIMEOUT = "0";
+		process.env.JUSTCLAW_TOOL_TIMEOUT = "0";
+		expect(resolveModelTimeoutMs()).toBe(0);
+		expect(resolveToolTimeoutMs()).toBe(0);
+	});
+
+	test("reject non-integer and negative values", () => {
+		for (const raw of ["abc", "-1", "1.5", "60s"]) {
+			process.env.JUSTCLAW_MODEL_TIMEOUT = raw;
+			expect(() => resolveModelTimeoutMs()).toThrow(
+				"JUSTCLAW_MODEL_TIMEOUT must be a non-negative integer number of seconds",
+			);
+			process.env.JUSTCLAW_TOOL_TIMEOUT = raw;
+			expect(() => resolveToolTimeoutMs()).toThrow(
+				"JUSTCLAW_TOOL_TIMEOUT must be a non-negative integer number of seconds",
 			);
 		}
 	});
@@ -1978,6 +2032,99 @@ describe("runLlmLoop", () => {
 		const droppedTypes = dropped.map((d) => (d as { type?: string }).type);
 		expect(droppedTypes).toContain("event.dropped.v1");
 		expect(droppedTypes).not.toContain("message.send.v1");
+	});
+
+	test("reports a module tool timeout as a tool result without failing the turn", async () => {
+		process.env.JUSTCLAW_TOOL_TIMEOUT = "1";
+		const home = await createTempDir("justclaw-llm-tool-timeout-");
+		const queue = new EventQueue(path.join(home, "events.db"));
+		queue.enqueue("slowmod", { type: "event.v1", kind: "test" });
+
+		const notified: { type?: string; tool?: string; output?: string }[] = [];
+		const daemons = [
+			{
+				manifest: { name: "slowmod", replyable: true },
+				restartAttempts: 2,
+				tools: [
+					{ name: "wait", parameters: { type: "object", properties: {} } },
+				],
+				peer: {
+					// Never resolves: the module is alive but unresponsive.
+					request: () => new Promise(() => {}),
+					notify: (method: string, params: unknown) => {
+						if (method === "event") {
+							notified.push(
+								params as { type?: string; tool?: string; output?: string },
+							);
+						}
+					},
+				},
+			},
+		] as unknown as StartedDaemon[];
+
+		const rc = new RunContext();
+		let toolOutput: unknown;
+		const mockRunner = {
+			run: async (
+				agent: Agent,
+				_input: unknown,
+				opts: { signal?: AbortSignal },
+			) => {
+				toolOutput = await findFunctionTool(agent, "slowmod__wait").invoke(
+					rc,
+					"{}",
+					{ signal: opts.signal },
+				);
+				// The turn continues after the timeout and still produces a reply.
+				return { finalOutput: "handled", history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: daemons }, "test-model", {
+			runner: mockRunner,
+		});
+		await waitUntil(() => notified.some((n) => n.type === "message.send.v1"));
+		queue.close();
+		await loopTask;
+
+		expect(toolOutput).toBe("error: module did not respond within 1s");
+		// The event is not dropped: the reply is delivered normally.
+		const types = notified.map((n) => n.type);
+		expect(types).toContain("message.send.v1");
+		expect(types).not.toContain("event.dropped.v1");
+		// The timed-out call is still reported to the delivery target.
+		const toolCall = notified.find((n) => n.type === "tool_call.v1");
+		expect(toolCall?.tool).toBe("slowmod__wait");
+		expect(toolCall?.output).toContain("did not respond within 1s");
+		// A module that only ever times out has not proved healthy.
+		expect(
+			(daemons[0] as unknown as { restartAttempts: number }).restartAttempts,
+		).toBe(2);
+	});
+
+	test("applies the model timeout to the agent", async () => {
+		process.env.JUSTCLAW_MODEL_TIMEOUT = "42";
+		const home = await createTempDir("justclaw-llm-model-timeout-");
+		const queue = new EventQueue(path.join(home, "events.db"));
+		queue.enqueue("srcmod", { type: "event.v1", kind: "test" });
+
+		let seen: number | undefined;
+		const mockRunner = {
+			run: async (agent: Agent) => {
+				seen = (agent as unknown as { modelSettings?: { timeoutMs?: number } })
+					.modelSettings?.timeoutMs;
+				return { finalOutput: "", history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: [] }, "test-model", {
+			runner: mockRunner,
+		});
+		await waitUntil(() => seen !== undefined);
+		queue.close();
+		await loopTask;
+
+		expect(seen).toBe(42_000);
 	});
 
 	test("resets restartAttempts after a module tool call resolves", async () => {

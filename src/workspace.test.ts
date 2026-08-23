@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createWorkspaceSandboxBaseCommand } from "./sandbox";
 import {
 	resolveWorkspaceDir,
 	runReadFileBase64,
+	runSandboxed,
 	WorkspaceEditor,
 } from "./workspace";
 
@@ -233,6 +235,53 @@ describe("WorkspaceEditor", () => {
 				path.join(root, "does-not-exist.png"),
 			);
 			expect(r.ok).toBe(false);
+		},
+	);
+});
+
+describe("runSandboxed", () => {
+	test.skipIf(!hasSandbox)(
+		"returns output and exit code for a command that finishes",
+		async () => {
+			const root = await createTempDir("justclaw-sandboxed-ok-");
+			const hist = path.join(root, "history");
+			await mkdir(hist, { recursive: true });
+			const spec = await createWorkspaceSandboxBaseCommand(root, hist, {
+				platform: process.platform,
+			});
+			const result = await runSandboxed({
+				cmd: [...spec.cmdPrefix, "sh", "-c", "echo marker"],
+				cwd: root,
+				env: spec.env,
+			});
+			expect(result.timedOut).toBe(false);
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout.trim()).toBe("marker");
+		},
+	);
+
+	test.skipIf(!hasSandbox)(
+		"kills a command that outlives its timeout and keeps partial output",
+		async () => {
+			const root = await createTempDir("justclaw-sandboxed-hang-");
+			const hist = path.join(root, "history");
+			await mkdir(hist, { recursive: true });
+			const spec = await createWorkspaceSandboxBaseCommand(root, hist, {
+				platform: process.platform,
+			});
+			const started = Date.now();
+			const result = await runSandboxed({
+				cmd: [...spec.cmdPrefix, "sh", "-c", "echo partial; sleep 30"],
+				cwd: root,
+				env: spec.env,
+				timeoutMs: 200,
+			});
+			expect(result.timedOut).toBe(true);
+			expect(result.exitCode).not.toBe(0);
+			// Partial output survives the kill, so a failure message can still carry it.
+			expect(result.stdout).toContain("partial");
+			// Resolved by the timeout, not by the command finishing on its own.
+			expect(Date.now() - started).toBeLessThan(10_000);
 		},
 	);
 });
