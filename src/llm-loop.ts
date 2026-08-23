@@ -147,6 +147,42 @@ export function resolveMaxTurns(): number {
 	return parsed;
 }
 
+// Timeouts are configured in whole seconds; both resolvers return milliseconds
+// because that is what setTimeout and the SDK take. `0` disables the bound.
+function resolveTimeoutMs(name: string, defaultSeconds: number): number {
+	const raw = process.env[name];
+	if (raw === undefined || raw === "") {
+		return defaultSeconds * 1000;
+	}
+	const parsed = Number(raw);
+	if (!Number.isInteger(parsed) || parsed < 0) {
+		throw new Error(
+			`${name} must be a non-negative integer number of seconds, got ${JSON.stringify(raw)}`,
+		);
+	}
+	return parsed * 1000;
+}
+
+/**
+ * Bound on a single model call. The LLM queue is serial, so a request the
+ * provider never answers blocks every other event, not just this one. On expiry
+ * the SDK throws ModelTimeoutError, which lands in the per-event catch below and
+ * drops the event like any other LLM failure — the source module is notified and
+ * decides whether to re-emit.
+ */
+export function resolveModelTimeoutMs(): number {
+	return resolveTimeoutMs("JUSTCLAW_MODEL_TIMEOUT", 600);
+}
+
+/**
+ * Bound on a single module tool call. Unlike a model timeout this does not fail
+ * the event: the timeout is returned to the model as the tool result so the rest
+ * of the turn survives one unresponsive module.
+ */
+export function resolveToolTimeoutMs(): number {
+	return resolveTimeoutMs("JUSTCLAW_TOOL_TIMEOUT", 60);
+}
+
 // Whether to strip reasoning items carried over from previous events before
 // sending the history to the model. Defaults to keeping them: the Responses
 // API path carries only an item id (no summary or encrypted content is
@@ -869,35 +905,74 @@ function wrapWithNotification(
 	};
 }
 
-// Resolve/reject with the module tool request, but reject early if the run's
-// abort signal fires first. A hung-but-alive module has no timeout of its own,
-// so without this a stuck request would stall the single serial queue forever
-// and sessions.skip.v1 could not recover it. Rejecting unwinds runner.run so the
-// normal abort -> event.dropped.v1 path runs.
+// Raised when a module does not answer a tool call within JUSTCLAW_TOOL_TIMEOUT.
+// Distinct from an abort so the caller can tell "this module is unresponsive"
+// (reportable to the model, turn continues) from "the run was cancelled" (must
+// unwind).
+class ModuleToolTimeoutError extends Error {}
+
+// Resolve/reject with the module tool request, but settle early if the run's
+// abort signal fires or the module misses its deadline. A hung-but-alive module
+// has no timeout of its own, so without this a stuck request would stall the
+// single serial queue: before the deadline existed, sessions.skip.v1 was the only
+// way out. Rejecting on abort unwinds runner.run so the normal
+// abort -> event.dropped.v1 path runs.
+//
+// The pending JSON-RPC request is deliberately left registered on timeout. A late
+// response then resolves a promise nobody awaits, which is harmless; dropping the
+// entry instead would make that response uncorrelatable and raise a local error.
 function requestWithAbort(
 	request: Promise<unknown>,
 	signal: AbortSignal | undefined,
+	timeoutMs: number,
 ): Promise<unknown> {
-	if (!signal) {
+	if (!signal && timeoutMs === 0) {
 		return request;
 	}
 	return new Promise<unknown>((resolve, reject) => {
-		const onAbort = () =>
+		let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+		const cleanup = () => {
+			if (timeoutHandle !== undefined) {
+				clearTimeout(timeoutHandle);
+			}
+			signal?.removeEventListener("abort", onAbort);
+		};
+		const onAbort = () => {
+			cleanup();
 			reject(new Error("run aborted before module tool responded"));
-		if (signal.aborted) {
+		};
+		if (signal?.aborted) {
 			onAbort();
 			return;
 		}
-		signal.addEventListener("abort", onAbort, { once: true });
-		request
-			.then(resolve, reject)
-			.finally(() => signal.removeEventListener("abort", onAbort));
+		signal?.addEventListener("abort", onAbort);
+		if (timeoutMs > 0) {
+			timeoutHandle = setTimeout(() => {
+				cleanup();
+				reject(
+					new ModuleToolTimeoutError(
+						`module did not respond within ${timeoutMs / 1000}s`,
+					),
+				);
+			}, timeoutMs);
+		}
+		request.then(
+			(value) => {
+				cleanup();
+				resolve(value);
+			},
+			(error) => {
+				cleanup();
+				reject(error);
+			},
+		);
 	});
 }
 
 function buildModuleTools(
 	daemons: StartedDaemon[],
 	delivery: ToolResultDelivery,
+	toolTimeoutMs: number,
 ): Tool[] {
 	return daemons.flatMap((daemon) =>
 		daemon.tools.map((toolDef) =>
@@ -908,10 +983,23 @@ function buildModuleTools(
 				parameters: toolDef.parameters as any,
 				strict: false,
 				execute: async (input: unknown, _context, details) => {
-					const result = await requestWithAbort(
-						daemon.peer.request(`tool/${toolDef.name}`, input ?? {}),
-						details?.signal,
-					);
+					let result: unknown;
+					try {
+						result = await requestWithAbort(
+							daemon.peer.request(`tool/${toolDef.name}`, input ?? {}),
+							details?.signal,
+							toolTimeoutMs,
+						);
+					} catch (error) {
+						// One unresponsive module must not cost the whole turn: return the
+						// timeout as this tool's result and let the model decide what to do.
+						// Returning (rather than throwing) also keeps the tool_call.v1
+						// notification firing, since the wrapper awaits this value.
+						if (error instanceof ModuleToolTimeoutError) {
+							return `error: ${error.message}`;
+						}
+						throw error;
+					}
 					// Proved healthy: serving a tool call resets the
 					// consecutive-failure count.
 					daemon.restartAttempts = 0;
@@ -1118,12 +1206,19 @@ export async function runLlmLoop(
 	const maxTurns = resolveMaxTurns();
 	const dropReasoningHistory = resolveDropReasoningHistory();
 	const inputModalities = resolveInputModalities();
+	const modelTimeoutMs = resolveModelTimeoutMs();
+	const toolTimeoutMs = resolveToolTimeoutMs();
 	const sessionStore = options?.sessionStore;
 	const baseAgent = new Agent({
 		name: "justclaw",
 		model,
 		instructions: "",
 		tools: [],
+		// The SDK rejects timeoutMs <= 0, so an unbounded configuration omits the
+		// setting rather than passing 0. clone() below carries modelSettings over.
+		...(modelTimeoutMs > 0
+			? { modelSettings: { timeoutMs: modelTimeoutMs } }
+			: {}),
 	});
 
 	const session = {
@@ -1513,9 +1608,12 @@ export async function runLlmLoop(
 			...(options?.workspaceTools ?? []).map((toolItem) =>
 				wrapWithNotification(toolItem, () => currentTarget, daemonsRef),
 			),
-			...buildModuleTools(daemonsRef.current, toolResultDelivery).map(
-				(toolItem) =>
-					wrapWithNotification(toolItem, () => currentTarget, daemonsRef),
+			...buildModuleTools(
+				daemonsRef.current,
+				toolResultDelivery,
+				toolTimeoutMs,
+			).map((toolItem) =>
+				wrapWithNotification(toolItem, () => currentTarget, daemonsRef),
 			),
 			...coreTools.map((toolItem) =>
 				wrapWithNotification(toolItem, () => currentTarget, daemonsRef),

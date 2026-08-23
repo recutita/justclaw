@@ -168,6 +168,77 @@ export class WorkspaceShell implements Shell {
 	}
 }
 
+// Sandboxed helper processes below are bounded by this timeout. `shell` takes a
+// per-call timeout from the model; these tools expose none, so the bound is fixed
+// here instead of being made configurable. It is not theoretical: a path from
+// JUSTCLAW_SANDBOX_RW_PATHS can be a network mount where `cat` or `rm` blocks
+// indefinitely, and the single serial LLM queue blocks with it.
+const FILE_TOOL_TIMEOUT_SECONDS = 30;
+const FILE_TOOL_TIMEOUT_MS = FILE_TOOL_TIMEOUT_SECONDS * 1000;
+const FILE_TOOL_TIMEOUT_MESSAGE = `timed out after ${FILE_TOOL_TIMEOUT_SECONDS}s`;
+
+export type SandboxRunResult = {
+	timedOut: boolean;
+	exitCode: number | null;
+	stdout: string;
+	stderr: string;
+};
+
+/** Exported, and `timeoutMs` overridable, so the timeout path is testable without a 30s wait. */
+export async function runSandboxed(options: {
+	cmd: string[];
+	cwd: string;
+	env: NodeJS.ProcessEnv;
+	stdin?: Uint8Array;
+	timeoutMs?: number;
+}): Promise<SandboxRunResult> {
+	const timeoutMs = options.timeoutMs ?? FILE_TOOL_TIMEOUT_MS;
+	const proc = Bun.spawn({
+		cmd: options.cmd,
+		cwd: options.cwd,
+		env: options.env,
+		stdin: options.stdin ?? "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+
+	// Drain both pipes while waiting rather than awaiting `exited` first: a child
+	// that fills a pipe buffer blocks on write and never exits, which would turn a
+	// healthy `cat` of a large file into a timeout.
+	const collected = (async () => {
+		const [stdout, stderr] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+		]);
+		await proc.exited;
+		return { stdout, stderr };
+	})();
+
+	let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+	const timeoutPromise = new Promise<"timeout">((resolve) => {
+		timeoutHandle = setTimeout(() => resolve("timeout"), timeoutMs);
+	});
+	const race = await Promise.race([
+		collected.then(() => "done" as const),
+		timeoutPromise,
+	]);
+	clearTimeout(timeoutHandle);
+
+	if (race === "timeout") {
+		proc.kill("SIGKILL");
+	}
+	// Safe to await after the kill: the pipes close with the process, so this
+	// settles either way, and any partial output is kept.
+	const { stdout, stderr } = await collected;
+
+	return {
+		timedOut: race === "timeout",
+		exitCode: proc.exitCode,
+		stdout,
+		stderr,
+	};
+}
+
 // Path boundary enforcement is delegated to the platform sandbox (bwrap / sandbox-exec).
 // The sandbox grants rw access to the workspace, character, and modules directories, and the kernel
 // enforces it. createFile and deleteFile run inside the sandbox for the same reason as
@@ -182,14 +253,14 @@ async function runCreateFile(
 	characterDir?: string,
 	modulesRoot?: string,
 	skillsDir?: string,
-): Promise<{ ok: boolean; stderr: string }> {
+): Promise<{ ok: boolean; timedOut: boolean; stderr: string }> {
 	const spec = await createWorkspaceSandboxBaseCommand(
 		workspaceDir,
 		historyDir,
 		{ platform, characterDir, modulesRoot, skillsDir },
 	);
 	// Pass dirname and path as positional args to avoid shell-quoting the values.
-	const proc = Bun.spawn({
+	const result = await runSandboxed({
 		cmd: [
 			...spec.cmdPrefix,
 			"sh",
@@ -200,14 +271,14 @@ async function runCreateFile(
 			absPath,
 		],
 		cwd: workspaceDir,
-		stdin: new TextEncoder().encode(content),
-		stdout: "pipe",
-		stderr: "pipe",
 		env: spec.env,
+		stdin: new TextEncoder().encode(content),
 	});
-	const stderr = await new Response(proc.stderr).text();
-	await proc.exited;
-	return { ok: proc.exitCode === 0, stderr };
+	return {
+		ok: !result.timedOut && result.exitCode === 0,
+		timedOut: result.timedOut,
+		stderr: result.timedOut ? FILE_TOOL_TIMEOUT_MESSAGE : result.stderr,
+	};
 }
 
 async function runDeleteFile(
@@ -218,23 +289,22 @@ async function runDeleteFile(
 	characterDir?: string,
 	modulesRoot?: string,
 	skillsDir?: string,
-): Promise<{ ok: boolean; stderr: string }> {
+): Promise<{ ok: boolean; timedOut: boolean; stderr: string }> {
 	const spec = await createWorkspaceSandboxBaseCommand(
 		workspaceDir,
 		historyDir,
 		{ platform, characterDir, modulesRoot, skillsDir },
 	);
-	const proc = Bun.spawn({
+	const result = await runSandboxed({
 		cmd: [...spec.cmdPrefix, "rm", absPath],
 		cwd: workspaceDir,
-		stdin: "ignore",
-		stdout: "pipe",
-		stderr: "pipe",
 		env: spec.env,
 	});
-	const stderr = await new Response(proc.stderr).text();
-	await proc.exited;
-	return { ok: proc.exitCode === 0, stderr };
+	return {
+		ok: !result.timedOut && result.exitCode === 0,
+		timedOut: result.timedOut,
+		stderr: result.timedOut ? FILE_TOOL_TIMEOUT_MESSAGE : result.stderr,
+	};
 }
 
 async function runReadFile(
@@ -245,26 +315,28 @@ async function runReadFile(
 	characterDir?: string,
 	modulesRoot?: string,
 	skillsDir?: string,
-): Promise<{ ok: boolean; content: string; stderr: string }> {
+): Promise<{
+	ok: boolean;
+	timedOut: boolean;
+	content: string;
+	stderr: string;
+}> {
 	const spec = await createWorkspaceSandboxBaseCommand(
 		workspaceDir,
 		historyDir,
 		{ platform, characterDir, modulesRoot, skillsDir },
 	);
-	const proc = Bun.spawn({
+	const result = await runSandboxed({
 		cmd: [...spec.cmdPrefix, "cat", absPath],
 		cwd: workspaceDir,
-		stdin: "ignore",
-		stdout: "pipe",
-		stderr: "pipe",
 		env: spec.env,
 	});
-	const [content, stderr] = await Promise.all([
-		new Response(proc.stdout).text(),
-		new Response(proc.stderr).text(),
-	]);
-	await proc.exited;
-	return { ok: proc.exitCode === 0, content, stderr };
+	return {
+		ok: !result.timedOut && result.exitCode === 0,
+		timedOut: result.timedOut,
+		content: result.stdout,
+		stderr: result.timedOut ? FILE_TOOL_TIMEOUT_MESSAGE : result.stderr,
+	};
 }
 
 /** Like {@link runReadFile}, but returns raw file bytes as a single-line base64 string via sandboxed `base64`. */
@@ -276,7 +348,12 @@ export async function runReadFileBase64(
 	characterDir?: string,
 	modulesRoot?: string,
 	skillsDir?: string,
-): Promise<{ ok: boolean; content: string; stderr: string }> {
+): Promise<{
+	ok: boolean;
+	timedOut: boolean;
+	content: string;
+	stderr: string;
+}> {
 	const spec = await createWorkspaceSandboxBaseCommand(
 		workspaceDir,
 		historyDir,
@@ -288,23 +365,16 @@ export async function runReadFileBase64(
 	// and also makes the exit code reflect base64/open failures -- a `base64 | tr`
 	// pipeline would mask them behind tr's always-zero exit. Newlines (GNU wraps
 	// at 76 columns) are stripped in JS so no second piped process is needed.
-	const proc = Bun.spawn({
+	const result = await runSandboxed({
 		cmd: [...spec.cmdPrefix, "sh", "-c", 'base64 < "$1"', "--", absPath],
 		cwd: workspaceDir,
-		stdin: "ignore",
-		stdout: "pipe",
-		stderr: "pipe",
 		env: spec.env,
 	});
-	const [content, stderr] = await Promise.all([
-		new Response(proc.stdout).text(),
-		new Response(proc.stderr).text(),
-	]);
-	await proc.exited;
 	return {
-		ok: proc.exitCode === 0,
-		content: content.replace(/\r?\n/g, ""),
-		stderr,
+		ok: !result.timedOut && result.exitCode === 0,
+		timedOut: result.timedOut,
+		content: result.stdout.replace(/\r?\n/g, ""),
+		stderr: result.timedOut ? FILE_TOOL_TIMEOUT_MESSAGE : result.stderr,
 	};
 }
 
@@ -332,7 +402,10 @@ async function runEditFile(
 		skillsDir,
 	);
 	if (!read.ok) {
-		return { status: "failed", output: "file not found" };
+		return {
+			status: "failed",
+			output: read.timedOut ? read.stderr : "file not found",
+		};
 	}
 	const content = read.content;
 	const count = content.split(old).length - 1;

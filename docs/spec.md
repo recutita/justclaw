@@ -43,6 +43,24 @@ The protocol provides best-effort delivery only. The core does not retry, persis
 
 Modules with durability requirements should implement their own queuing, retry, and persistence (using their `modules/{name}/` directory for state). Modules whose events are tolerable to loss (e.g., file watchers, metrics) can rely on plain notifications without additional handling.
 
+## Timeouts
+
+The LLM queue is serial, so an unbounded wait blocks every pending event, not just the one being processed. Three bounds exist, with deliberately different failure modes: a model that never answers costs the event, while a module that never answers costs only its own tool call.
+
+| Bounded operation | Bound | On expiry |
+|---|---|---|
+| Model call | `JUSTCLAW_MODEL_TIMEOUT` (seconds, default `600`) | The LLM cycle fails like any other LLM error: `event.dropped.v1` goes to the source module, which decides whether to re-emit. |
+| Module tool call (`tool/{name}`) | `JUSTCLAW_TOOL_TIMEOUT` (seconds, default `60`) | The call returns `error: module did not respond within {n}s` to the LLM as that tool's result. The turn continues and `tool_call.v1` is still delivered. |
+| Sandbox process behind `create_file`, `edit_file`, `delete_file`, `attach_image`, `attach_file` | Fixed 30 seconds | The process is killed (SIGKILL) and the tool reports `timed out after 30s`. Output written before the kill is preserved. |
+
+Both environment variables take a non-negative integer number of seconds. `0` disables that bound; any other non-integer or negative value fails at startup.
+
+`shell` is bounded separately by its own `timeout_ms` parameter (default 30000), which the LLM sets per call. The file tools expose no such parameter, so their bound is fixed rather than configurable.
+
+**Module tool timeouts do not restart the module.** Only a tool call the module actually serves resets its consecutive-failure count, so a module that only ever times out never proves healthy; but a timeout on its own is not a process failure and does not count toward `JUSTCLAW_MAX_RESTART_ATTEMPTS`.
+
+**A late response is discarded, not an error.** When a tool call times out the core leaves the JSON-RPC request registered. A response that arrives afterwards resolves a promise nobody is waiting on. Dropping the registration instead would make that response uncorrelatable, which is the one case the transport treats as a local error (see [Errors](#errors)).
+
 ## Module Capabilities
 
 A module may expose **tools** — request/response handlers the core can call. Tools are declared in the response to `initialize`.
@@ -701,7 +719,7 @@ The core notifies the source module when it **consumes an event for an LLM cycle
 That includes at least:
 
 - **Restart recovery:** the previous process exited while one or more events were still marked `running` in the queue (the LLM cycle had started but never finished).
-- **LLM failure:** the runner throws or otherwise fails after the event was consumed and before the cycle would have completed successfully.
+- **LLM failure:** the runner throws or otherwise fails after the event was consumed and before the cycle would have completed successfully. This includes a model call that exceeds `JUSTCLAW_MODEL_TIMEOUT` (see [Timeouts](#timeouts)).
 - **No adoptable session:** a session store is configured, the event was consumed from the queue, but no session could be adopted (no readable UUID `{id}.json` files on disk yet and no `sessions.switch.v1` applied before this event in the loop).
 
 **Delivery guarantee: at-least-once, not exactly-once.** `event.dropped.v1` is a best-effort signal that the LLM cycle *may* not have completed normally — it is not proof that it didn't. Restart recovery in particular cannot distinguish "the process exited before the cycle finished" from "the process exited after the cycle finished but before the queue row was marked complete": the row stays `running` until the core finishes marking it complete, and a crash in that narrow window leaves the row `running` on disk even though the cycle already ran to completion (for example, a reply was already delivered). Stale-row recovery on the next start has no way to tell the two cases apart, so it sends `event.dropped.v1` either way. A module that reacts by re-emitting the event can therefore cause it to be processed twice. Modules for which that matters must dedupe on re-emit — for example, by attaching an idempotency key to the event and having whatever consumes a redelivery (the module itself, or a downstream system) ignore a repeat of the same key.
@@ -874,6 +892,8 @@ Write full content to a file inside the workspace sandbox. Overwrites the file i
 create_file(path: string, content: string)
 ```
 
+The sandbox process is bounded by a fixed 30-second timeout (see [Timeouts](#timeouts)).
+
 | Parameter | Description |
 |---|---|
 | `path` | Absolute path to the file |
@@ -888,6 +908,8 @@ Replace an exact substring in an existing file inside the workspace sandbox. Pat
 ```
 edit_file(path: string, old: string, new: string)
 ```
+
+The sandbox process is bounded by a fixed 30-second timeout (see [Timeouts](#timeouts)).
 
 | Parameter | Description |
 |---|---|
@@ -904,6 +926,8 @@ Delete a file inside the workspace sandbox. Path boundaries are enforced by the 
 ```
 delete_file(path: string)
 ```
+
+The sandbox process is bounded by a fixed 30-second timeout (see [Timeouts](#timeouts)).
 
 | Parameter | Description |
 |---|---|
