@@ -1302,22 +1302,106 @@ describe("sandbox", () => {
 		).rejects.toThrow("bwrap backend is unavailable");
 	});
 
-	test("preserves environment variables in the launch spec", async () => {
+	test("filters secrets out of the module launch spec env", async () => {
 		const manifest = parseDaemonManifest("/tmp/example", "example", {
 			name: "example",
 			exec: "./run",
 			mode: "daemon",
 		});
-		const env = { ...process.env, OPENAI_API_KEY: "test-key" };
 
 		const spec = await createSandboxLaunchSpec(manifest, {
 			platform: "darwin",
-			env,
+			env: {
+				PATH: "/usr/bin",
+				HOME: "/home/dev",
+				JUSTCLAW_HOME: "/home/dev/justclaw",
+				JUSTCLAW_OPENAI_API_KEY: "core-credential",
+				OPENAI_API_KEY: "test-key",
+			},
 			lookupExecutable: async () => "/usr/bin/sandbox-exec",
 		});
 
-		expect(spec.env.OPENAI_API_KEY).toBe("test-key");
+		expect(spec.env.JUSTCLAW_OPENAI_API_KEY).toBeUndefined();
+		expect(spec.env.OPENAI_API_KEY).toBeUndefined();
+		expect(spec.env.HOME).toBe("/home/dev");
+		expect(spec.env.JUSTCLAW_HOME).toBe("/home/dev/justclaw");
+		// The core runtime dir is still prepended to the filtered PATH so a
+		// module shebang can resolve its interpreter.
+		expect(spec.env.PATH?.split(":")).toContain("/usr/bin");
+		expect(spec.env.PATH?.split(":")).toContain(path.dirname(process.execPath));
 		expect(spec.cmd[0]).toBe("/usr/bin/sandbox-exec");
+	});
+
+	test("JUSTCLAW_SANDBOX_ENV extends the module launch spec env", async () => {
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
+
+		const spec = await createSandboxLaunchSpec(manifest, {
+			platform: "darwin",
+			env: {
+				PATH: "/usr/bin",
+				JUSTCLAW_SANDBOX_ENV: "SLACK_BOT_TOKEN",
+				SLACK_BOT_TOKEN: "module-token",
+				JUSTCLAW_OPENAI_API_KEY: "core-credential",
+			},
+			lookupExecutable: async () => "/usr/bin/sandbox-exec",
+		});
+
+		expect(spec.env.SLACK_BOT_TOKEN).toBe("module-token");
+		expect(spec.env.JUSTCLAW_OPENAI_API_KEY).toBeUndefined();
+		// JUSTCLAW_SANDBOX_ENV names variables to let through; it does not name itself.
+		expect(spec.env.JUSTCLAW_SANDBOX_ENV).toBeUndefined();
+	});
+
+	test("passes justclaw directory overrides through to modules", async () => {
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
+
+		const spec = await createSandboxLaunchSpec(manifest, {
+			platform: "darwin",
+			env: {
+				PATH: "/usr/bin",
+				JUSTCLAW_HOME: "/home/dev/justclaw",
+				JUSTCLAW_WORKSPACE: "/srv/ws",
+				JUSTCLAW_CHARACTER: "/srv/character",
+				JUSTCLAW_SKILLS: "/srv/skills",
+			},
+			lookupExecutable: async () => "/usr/bin/sandbox-exec",
+		});
+
+		expect(spec.env.JUSTCLAW_WORKSPACE).toBe("/srv/ws");
+		expect(spec.env.JUSTCLAW_CHARACTER).toBe("/srv/character");
+		expect(spec.env.JUSTCLAW_SKILLS).toBe("/srv/skills");
+	});
+
+	test("JUSTCLAW_SANDBOX_RO_PATHS still reaches the mount resolver after the module env filter (linux)", async () => {
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
+
+		const spec = await createSandboxLaunchSpec(manifest, {
+			platform: "linux",
+			env: { PATH: "/usr/bin", JUSTCLAW_SANDBOX_RO_PATHS: "/srv/extra-ro" },
+			lookupExecutable: async () => "/usr/bin/bwrap",
+			pathExists: async (candidatePath) =>
+				candidatePath === "/tmp/example" ||
+				candidatePath === "/tmp" ||
+				candidatePath === "/srv/extra-ro",
+		});
+
+		expect(spec.cmd.join(" ")).toContain(
+			"--ro-bind /srv/extra-ro /srv/extra-ro",
+		);
+		// The path env vars themselves are not part of the filtered spawn env.
+		expect(spec.env.JUSTCLAW_SANDBOX_RO_PATHS).toBeUndefined();
 	});
 
 	test("normalizes TMPDIR to /tmp in the linux launch spec", async () => {
