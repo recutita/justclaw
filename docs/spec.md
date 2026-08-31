@@ -531,6 +531,23 @@ These are operator input, not module input, so there is no per-module injection 
 
 `JUSTCLAW_SANDBOX_RW_PATHS` grants are global: every module sandbox and the workspace sandbox get the same read-write access. For the workspace sandbox, that means the paths are reachable by the LLM (which drives the workspace shell).
 
+### Sandbox environment
+
+Neither sandbox inherits the parent environment. Module processes and the workspace sandbox receive the same filtered set: a fixed base allowlist, plus any variable named in `JUSTCLAW_SANDBOX_ENV` (colon-separated variable names). Everything else is dropped.
+
+| Base allowlist | Purpose |
+|---|---|
+| `PATH`, `HOME`, `TMPDIR`, `LANG`, `TZ`, `TERM`, `USER`, `LOGNAME`, and any `LC_*` | Standard process environment: find an interpreter, know home, temp, and locale |
+| `JUSTCLAW_HOME`, `JUSTCLAW_WORKSPACE`, `JUSTCLAW_CHARACTER`, `JUSTCLAW_SKILLS` | Locate justclaw's own directories. All four are needed: the last three override the paths otherwise derived from `JUSTCLAW_HOME`, so a process holding only `JUSTCLAW_HOME` computes the wrong path in exactly the configurations where an override is set |
+
+These name locations, not capabilities: whether a directory is reachable is decided by the mounts. A module sees `JUSTCLAW_CHARACTER` but cannot read that directory, because the module sandbox does not mount it.
+
+Unlike `JUSTCLAW_SANDBOX_RO_PATHS`/`_RW_PATHS`, this setting names variables rather than host paths, so there is nothing to validate against the filesystem; a name that is unset in the parent environment is silently dropped. After filtering, `PATH` is extended with the core's runtime directory (see above) and, on Linux, `TMPDIR` is pinned to `/tmp`.
+
+**Modules are not a trust boundary against the LLM.** The modules root is mounted read-write in the workspace sandbox, so the LLM writes and rewrites module entrypoints; whatever a module process can read, the LLM can read by editing that module's code. Naming a variable in `JUSTCLAW_SANDBOX_ENV` hands it to the agent, whichever sandbox the operator had in mind. That is also why the grant is not per-module: a per-module split would defend modules from each other, and modules are not adversaries of each other — they are parts of one agent.
+
+What the filter does keep out is the core's own credentials. `JUSTCLAW_OPENAI_API_KEY` and the other `JUSTCLAW_OPENAI_*` settings are absent from the base allowlist, so no sandboxed process holds the key the core uses for inference. The core processes events through a single serial LLM queue; an agent holding that key could call the model outside it. The filter is not a network boundary: both sandboxes have unrestricted network access, so a model endpoint that needs no credential stays reachable from either one.
+
 ## Operator instructions
 
 The bundled entrypoint reads `$JUSTCLAW_HOME/AGENTS.md` before every LLM turn. If present, its content is fenced in a `<system-instructions>` element and prepended to the character context instructions. The dedicated tag — distinct from the character-file tags below — labels the content's origin: operator instructions live in a fixed file the agent cannot edit, and the fence separates them from editable character content. The fence is a delimiter, not an enforcement mechanism; see [Fence trust model](#fence-trust-model).
@@ -582,7 +599,7 @@ The bundled LLM loop re-reads these files from disk immediately before each `eve
 
 ### Workspace sandbox
 
-Built-in `shell`, `create_file`, `edit_file`, and `delete_file` run inside the workspace sandbox. That sandbox grants read-write access to the workspace directory, read-write access to the character directory, read-write access to the runtime modules directory (the same path the core uses to discover and load modules; same mount semantics as the character directory), read-write access to the skills directory (when configured; same mount semantics as the character directory), and read-only access to the history directory (when it exists on the host), in addition to the standard OS read-only paths and temp rules described for module execution. Path boundaries are enforced by the sandbox; the application does not duplicate that check.
+Built-in `shell`, `create_file`, `edit_file`, and `delete_file` run inside the workspace sandbox. That sandbox grants read-write access to the workspace directory, read-write access to the character directory, read-write access to the runtime modules directory (the same path the core uses to discover and load modules; same mount semantics as the character directory), read-write access to the skills directory (when configured; same mount semantics as the character directory), and read-only access to the history directory (when it exists on the host), in addition to the standard OS read-only paths and temp rules described for module execution. Path boundaries are enforced by the sandbox; the application does not duplicate that check. The environment is filtered to the same allowlist as module processes (see [Sandbox environment](#sandbox-environment)).
 
 ## Skills directory
 

@@ -73,6 +73,7 @@ Type a message and press Enter. The LLM response is printed to the same terminal
 | `JUSTCLAW_OPENAI_INPUT_MODALITIES` | no | `image,file,audio` | Comma-separated list of multimodal input kinds the endpoint accepts (`image`, `file`, `audio`), or `none`. Bytes of a disabled kind are never sent, and `attach_image` / `attach_file` are not exposed to the LLM when their kind is disabled |
 | `JUSTCLAW_OPENAI_BASE_URL` | no | OpenAI default | Base URL for the API endpoint; set to use a compatible provider |
 | `JUSTCLAW_HOME` | no | `$HOME/justclaw` | Root directory for modules, workspace, history, character, and skills |
+| `JUSTCLAW_WORKSPACE` | no | `$JUSTCLAW_HOME/workspace` | Override path for the workspace directory |
 | `JUSTCLAW_CHARACTER` | no | `$JUSTCLAW_HOME/character` | Override path for the character directory |
 | `JUSTCLAW_SKILLS` | no | `$JUSTCLAW_HOME/skills` | Override path for the skills directory |
 | `JUSTCLAW_MAX_TURNS` | no | `10` | Maximum agent turns (LLM call to tool calls to repeat) per event before the runner gives up. Positive integer |
@@ -82,7 +83,7 @@ Type a message and press Enter. The LLM response is printed to the same terminal
 | `JUSTCLAW_MAX_RESTART_ATTEMPTS` | no | `1` | Maximum automatic restarts for a daemon that exits unexpectedly. Non-negative integer (`0` disables restart) |
 | `JUSTCLAW_SANDBOX_RO_PATHS` | no | — | Colon-separated absolute paths mounted read-only into the module sandbox and the workspace sandbox |
 | `JUSTCLAW_SANDBOX_RW_PATHS` | no | — | Colon-separated absolute paths mounted read-write into the module sandbox and the workspace sandbox (reachable by the LLM via the workspace sandbox) |
-| `JUSTCLAW_SANDBOX_ENV` | no | — | Colon-separated variable names to pass into the workspace sandbox in addition to its default allowlist (`PATH`, `HOME`, `TMPDIR`, `LANG`, `TZ`, `TERM`, `USER`, `LOGNAME`, `JUSTCLAW_HOME`, and any `LC_*` variable) |
+| `JUSTCLAW_SANDBOX_ENV` | no | — | Colon-separated variable names to pass into the module sandbox and the workspace sandbox in addition to the default allowlist (`PATH`, `HOME`, `TMPDIR`, `LANG`, `TZ`, `TERM`, `USER`, `LOGNAME`, `JUSTCLAW_HOME`, `JUSTCLAW_WORKSPACE`, `JUSTCLAW_CHARACTER`, `JUSTCLAW_SKILLS`, and any `LC_*` variable). Everything else, including `JUSTCLAW_OPENAI_API_KEY`, is dropped. A variable named here reaches the agent: it can rewrite module code. See [Sandbox environment](docs/spec.md#sandbox-environment) |
 
 ## Architecture
 
