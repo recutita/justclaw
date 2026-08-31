@@ -70,6 +70,13 @@ Prefer JSON-RPC, NDJSON, cron, XML, bwrap, and other battle-tested formats over 
 - Core is minimal. New functionality should default to being a module unless there is a clear reason to live in the core.
 - Match the existing structure of `modules/{name}/`.
 
+## Commits
+
+- **Subject line only.** Imperative mood, capitalized, no trailing period, no type prefix (`feat:`, `fix:`). Check `git log`: essentially every commit here is one line.
+- **No body.** Rationale about code belongs in a comment next to the code, and protocol rationale belongs in `docs/spec.md`; a commit body duplicates it somewhere nobody reads while working. Write one only when the rationale has nowhere else to live — a dependency upgrade is the case that has come up.
+- **No trailers.** No `Co-Authored-By`, no generator attribution.
+- Branch names: `feat/{topic}`, `refactor/{topic}`.
+
 ## Dependencies
 
 Do not add dependencies unless absolutely necessary. Fewer dependencies means less surface area, less supply-chain risk, faster installs, and easier upgrades.
