@@ -1446,7 +1446,7 @@ describe("runLlmLoop", () => {
 		expect(runnerCallCount).toBe(2);
 		expect(recorded).toHaveLength(1);
 		expect(recorded[0]?.method).toBe("event");
-		expect((recorded[0]?.params as { type?: string }).type).toBe(
+		expect((recorded[0]?.params as { type?: string } | undefined)?.type).toBe(
 			"event.dropped.v1",
 		);
 	});
@@ -1903,7 +1903,7 @@ describe("runLlmLoop", () => {
 
 		expect(recorded).toHaveLength(1);
 		expect(recorded[0]?.method).toBe("event");
-		expect((recorded[0]?.params as { type?: string }).type).toBe(
+		expect((recorded[0]?.params as { type?: string } | undefined)?.type).toBe(
 			"event.dropped.v1",
 		);
 	});
@@ -1967,7 +1967,7 @@ describe("runLlmLoop", () => {
 
 		expect(recorded).toHaveLength(1);
 		expect(recorded[0]?.method).toBe("event");
-		expect((recorded[0]?.params as { type?: string }).type).toBe(
+		expect((recorded[0]?.params as { type?: string } | undefined)?.type).toBe(
 			"event.dropped.v1",
 		);
 		expect(runnerCallCount).toBe(1);
@@ -2152,10 +2152,10 @@ describe("runLlmLoop", () => {
 
 		expect(runnerCallCount).toBe(0);
 		expect(recorded).toHaveLength(2);
-		expect((recorded[0]?.params as { type?: string }).type).toBe(
+		expect((recorded[0]?.params as { type?: string } | undefined)?.type).toBe(
 			"event.dropped.v1",
 		);
-		expect((recorded[1]?.params as { type?: string }).type).toBe(
+		expect((recorded[1]?.params as { type?: string } | undefined)?.type).toBe(
 			"event.dropped.v1",
 		);
 	});
