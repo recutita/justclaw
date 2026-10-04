@@ -12,8 +12,13 @@ import type {
 	ModelResponse,
 	Runner,
 } from "@openai/agents";
+import {
+	OpenAIChatCompletionsModel,
+	OpenAIResponsesModel,
+} from "@openai/agents";
 import type { FunctionTool } from "@openai/agents-core";
 import { RunContext } from "@openai/agents-core";
+import OpenAI from "openai";
 import { EventQueue, timestampFromUUIDv7 } from "./event-queue";
 import {
 	assistantText,
@@ -22,6 +27,7 @@ import {
 	leadingMessages,
 	ObservedModel,
 	resolveDropReasoningHistory,
+	resolveExtraBody,
 	resolveInputModalities,
 	resolveModelTimeoutMs,
 	resolveToolTimeoutMs,
@@ -45,8 +51,14 @@ const originalDropReasoning = process.env.JUSTCLAW_DROP_REASONING_HISTORY;
 const originalInputModalities = process.env.JUSTCLAW_OPENAI_INPUT_MODALITIES;
 const originalModelTimeout = process.env.JUSTCLAW_MODEL_TIMEOUT;
 const originalToolTimeout = process.env.JUSTCLAW_TOOL_TIMEOUT;
+const originalExtraBody = process.env.JUSTCLAW_OPENAI_EXTRA_BODY;
 
 afterEach(async () => {
+	if (originalExtraBody === undefined) {
+		delete process.env.JUSTCLAW_OPENAI_EXTRA_BODY;
+	} else {
+		process.env.JUSTCLAW_OPENAI_EXTRA_BODY = originalExtraBody;
+	}
 	if (originalOpenAIAPI === undefined) {
 		delete process.env.JUSTCLAW_OPENAI_API;
 	} else {
@@ -403,6 +415,33 @@ describe("resolveDropReasoningHistory", () => {
 			process.env.JUSTCLAW_DROP_REASONING_HISTORY = raw;
 			expect(() => resolveDropReasoningHistory()).toThrow(
 				'JUSTCLAW_DROP_REASONING_HISTORY must be "0" or "1"',
+			);
+		}
+	});
+});
+
+describe("resolveExtraBody", () => {
+	test("is undefined when unset or empty", () => {
+		delete process.env.JUSTCLAW_OPENAI_EXTRA_BODY;
+		expect(resolveExtraBody()).toBeUndefined();
+		process.env.JUSTCLAW_OPENAI_EXTRA_BODY = "";
+		expect(resolveExtraBody()).toBeUndefined();
+	});
+
+	test("parses a JSON object", () => {
+		process.env.JUSTCLAW_OPENAI_EXTRA_BODY =
+			'{"reasoning":{"effort":"medium"},"chat_template_kwargs":{"enable_thinking":false}}';
+		expect(resolveExtraBody()).toEqual({
+			reasoning: { effort: "medium" },
+			chat_template_kwargs: { enable_thinking: false },
+		});
+	});
+
+	test("rejects invalid JSON and non-objects", () => {
+		for (const raw of ["{", "null", "[]", '"medium"', "1"]) {
+			process.env.JUSTCLAW_OPENAI_EXTRA_BODY = raw;
+			expect(() => resolveExtraBody()).toThrow(
+				"JUSTCLAW_OPENAI_EXTRA_BODY must be a JSON object",
 			);
 		}
 	});
@@ -2456,6 +2495,88 @@ describe("runLlmLoop", () => {
 
 		expect(seen).toBe(42_000);
 	});
+
+	// The runner strips reasoning settings from providerData for a model it
+	// identifies by a non-GPT-5 name while its default model is GPT-5 (the SDK
+	// default). This drives the loop's own agent through a real Runner to a
+	// local endpoint, in both API modes, and checks the fields reach the body.
+	for (const api of ["responses", "chat_completions"] as const) {
+		test(`sends JUSTCLAW_OPENAI_EXTRA_BODY in the ${api} request body`, async () => {
+			process.env.JUSTCLAW_OPENAI_EXTRA_BODY =
+				'{"reasoning":{"effort":"medium"},"chat_template_kwargs":{"enable_thinking":false}}';
+			let body: Record<string, unknown> | undefined;
+			const server = Bun.serve({
+				port: 0,
+				fetch: async (req) => {
+					body = (await req.json()) as Record<string, unknown>;
+					return Response.json(
+						api === "responses"
+							? {
+									id: "resp_1",
+									object: "response",
+									created_at: 0,
+									model: "local-model",
+									status: "completed",
+									output: [
+										{
+											type: "message",
+											id: "msg_1",
+											role: "assistant",
+											status: "completed",
+											content: [
+												{ type: "output_text", text: "ok", annotations: [] },
+											],
+										},
+									],
+									usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+								}
+							: {
+									id: "chatcmpl_1",
+									object: "chat.completion",
+									created: 0,
+									model: "local-model",
+									choices: [
+										{
+											index: 0,
+											message: { role: "assistant", content: "ok" },
+											finish_reason: "stop",
+										},
+									],
+									usage: {
+										prompt_tokens: 1,
+										completion_tokens: 1,
+										total_tokens: 2,
+									},
+								},
+					);
+				},
+			});
+			const home = await createTempDir("justclaw-llm-extra-body-");
+			const queue = new EventQueue(path.join(home, "events.db"));
+			queue.enqueue("srcmod", { type: "event.v1", kind: "test" });
+			const client = new OpenAI({
+				apiKey: "test",
+				baseURL: `http://127.0.0.1:${server.port}/v1`,
+			});
+			try {
+				const loopTask = runLlmLoop(queue, { current: [] }, "local-model", {
+					innerModel:
+						api === "responses"
+							? new OpenAIResponsesModel(client, "local-model")
+							: new OpenAIChatCompletionsModel(client, "local-model"),
+				});
+				await waitUntil(() => body !== undefined);
+				queue.close();
+				await loopTask;
+			} finally {
+				server.stop(true);
+			}
+
+			expect(body?.model).toBe("local-model");
+			expect(body?.reasoning).toEqual({ effort: "medium" });
+			expect(body?.chat_template_kwargs).toEqual({ enable_thinking: false });
+		});
+	}
 
 	test("resets restartAttempts after a module tool call resolves", async () => {
 		const home = await createTempDir("justclaw-llm-tool-reset-");

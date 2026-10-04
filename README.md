@@ -72,6 +72,7 @@ Type a message and press Enter. The LLM response is printed to the same terminal
 | `JUSTCLAW_OPENAI_API` | no | `chat_completions` | OpenAI API mode: `chat_completions` or `responses`. Use `responses` for multimodal tool results; compatible providers must support `/v1/responses` |
 | `JUSTCLAW_OPENAI_INPUT_MODALITIES` | no | `image,file,audio` | Comma-separated list of multimodal input kinds the endpoint accepts (`image`, `file`, `audio`), or `none`. Bytes of a disabled kind are never sent, and `attach_image` / `attach_file` are not exposed to the LLM when their kind is disabled |
 | `JUSTCLAW_OPENAI_BASE_URL` | no | OpenAI default | Base URL for the API endpoint; set to use a compatible provider |
+| `JUSTCLAW_OPENAI_EXTRA_BODY` | no | — | JSON object whose fields are added to the top level of every model request body, in either API mode, overriding fields of the same name. For provider settings justclaw does not set itself, e.g. `{"reasoning":{"effort":"medium"}}`, or vLLM's `{"chat_template_kwargs":{...}}` |
 | `JUSTCLAW_HOME` | no | `$HOME/justclaw` | Root directory for modules, workspace, history, character, and skills |
 | `JUSTCLAW_WORKSPACE` | no | `$JUSTCLAW_HOME/workspace` | Override path for the workspace directory |
 | `JUSTCLAW_CHARACTER` | no | `$JUSTCLAW_HOME/character` | Override path for the character directory |
