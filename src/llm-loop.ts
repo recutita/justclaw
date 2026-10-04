@@ -4,7 +4,14 @@ import {
 	Agent,
 	type AgentInputItem,
 	type FunctionToolResult,
+	type Model,
+	type ModelRequest,
+	type ModelResponse,
+	type ModelRetryAdvice,
+	type ModelRetryAdviceRequest,
+	OpenAIProvider,
 	Runner,
+	type StreamEvent,
 	setDefaultOpenAIClient,
 	setOpenAIAPI,
 	setTracingDisabled,
@@ -236,6 +243,114 @@ export function dropReasoningItems(
 	history: AgentInputItem[],
 ): AgentInputItem[] {
 	return history.filter((item) => item.type !== "reasoning");
+}
+
+/**
+ * The assistant text in a list of items, joined with a blank line. Reasoning,
+ * tool calls, and user items are skipped.
+ */
+export function assistantText(items: readonly unknown[]): string {
+	const parts: string[] = [];
+	for (const item of items) {
+		if (!isRecord(item) || item.role !== "assistant") continue;
+		if (!Array.isArray(item.content)) continue;
+		for (const part of item.content) {
+			if (
+				isRecord(part) &&
+				part.type === "output_text" &&
+				typeof part.text === "string" &&
+				part.text.trim()
+			) {
+				parts.push(part.text.trim());
+			}
+		}
+	}
+	return parts.join("\n\n");
+}
+
+/**
+ * The leading assistant messages of a model response: the items before its
+ * first tool call, minus any reasoning at the end of that run. These can be
+ * stored before the tools run. A tool call cannot, because its result does
+ * not exist yet and a call without a result is rejected on the next request.
+ * Reasoning that precedes a tool call cannot either: the Responses API
+ * rejects a reasoning item sent without the item that followed it.
+ */
+export function leadingMessages(
+	output: readonly AgentInputItem[],
+): AgentInputItem[] {
+	const end = output.findIndex(
+		(item) => item.type !== "message" && item.type !== "reasoning",
+	);
+	const leading = end === -1 ? [...output] : output.slice(0, end);
+	while (leading.at(-1)?.type === "reasoning") leading.pop();
+	return leading;
+}
+
+/**
+ * Wraps the configured model to act on each model call of a run as it
+ * happens. When a response arrives, `onResponse` gets the call's input and
+ * the response's output; the loop uses it to save the session history. Then
+ * the response's assistant text is delivered, before the tools it calls run.
+ *
+ * Why not the run result: the SDK's `finalOutput` holds only a response that
+ * ended the run without calling a tool. Models often write the reply in the
+ * same response as a tool call (a memory write, say) and then end with
+ * `turn_end`, so delivering `finalOutput` dropped that reply; it was stored in
+ * history but never sent. Collecting the text when the run ends would fix the
+ * loss but still hold a finished reply back for every tool round-trip after
+ * it. The same holds for the history: saved only at the end, a run that
+ * failed later lost a reply already sent and tool calls already run. The SDK
+ * has no per-call hook, so the model itself is the one place every call
+ * passes through.
+ *
+ * Why after the response, not before the call: a response proves the
+ * provider accepted the input. Saving an input before that would let one the
+ * provider rejects (a tool result past the context window, say) into the
+ * history, and every later event in the session would fail on it.
+ *
+ * The loop never streams, so `getStreamedResponse` is passed through as is.
+ */
+export class ObservedModel implements Model {
+	readonly #resolve: () => Promise<Model>;
+	readonly #onResponse: (
+		input: ModelRequest["input"],
+		output: AgentInputItem[],
+	) => Promise<void>;
+	readonly #deliver: (text: string) => void;
+
+	constructor(
+		resolve: () => Promise<Model>,
+		onResponse: (
+			input: ModelRequest["input"],
+			output: AgentInputItem[],
+		) => Promise<void>,
+		deliver: (text: string) => void,
+	) {
+		this.#resolve = resolve;
+		this.#onResponse = onResponse;
+		this.#deliver = deliver;
+	}
+
+	async getResponse(request: ModelRequest): Promise<ModelResponse> {
+		const response = await (await this.#resolve()).getResponse(request);
+		await this.#onResponse(request.input, response.output);
+		const text = assistantText(response.output);
+		if (text) this.#deliver(text);
+		return response;
+	}
+
+	async *getStreamedResponse(
+		request: ModelRequest,
+	): AsyncIterable<StreamEvent> {
+		yield* (await this.#resolve()).getStreamedResponse(request);
+	}
+
+	async getRetryAdvice(
+		args: ModelRetryAdviceRequest,
+	): Promise<ModelRetryAdvice | undefined> {
+		return (await this.#resolve()).getRetryAdvice?.(args);
+	}
 }
 
 function escapeXml(s: string): string {
@@ -1070,6 +1185,11 @@ function buildRouteMessageTool(
 
 export type LlmLoopOptions = {
 	runner?: Runner;
+	/**
+	 * The model wrapped by ObservedModel. Defaults to the OpenAI provider's
+	 * model for the configured name; tests pass a fake.
+	 */
+	innerModel?: Model;
 	sessionStore?: SessionStore;
 	workspaceTools?: Tool[];
 	workspaceDir?: string;
@@ -1220,6 +1340,15 @@ export async function runLlmLoop(
 	const modelTimeoutMs = resolveModelTimeoutMs();
 	const toolTimeoutMs = resolveToolTimeoutMs();
 	const sessionStore = options?.sessionStore;
+	// Resolved on the first model call and shared across events, so starting
+	// the loop needs no API client (tests drive it with a mock runner).
+	let innerModel: Promise<Model> | undefined;
+	const resolveInnerModel = (): Promise<Model> => {
+		innerModel ??= options?.innerModel
+			? Promise.resolve(options.innerModel)
+			: new OpenAIProvider().getModel(model);
+		return innerModel;
+	};
 	const baseAgent = new Agent({
 		name: "justclaw",
 		model,
@@ -1235,6 +1364,26 @@ export async function runLlmLoop(
 	const session = {
 		currentSessionId: null as string | null,
 		history: [] as AgentInputItem[],
+	};
+
+	// Writes the in-memory history to the active session's file. Re-checks
+	// liveness first: sessions.delete.v1 removes the history file mid-run, and
+	// a turn in flight must not recreate it (spec: deleted sessions are never
+	// written again). active_session_id alone is insufficient because the
+	// delete removes the file before it clears that metadata, so also confirm
+	// the file still exists.
+	const persistHistory = async (): Promise<void> => {
+		if (!sessionStore || session.currentSessionId === null) return;
+		const stillActive =
+			session.currentSessionId === eventQueue.getMeta(ACTIVE_SESSION_META_KEY);
+		const stillOnDisk =
+			stillActive &&
+			(await sessionStore.load(session.currentSessionId)) !== null;
+		if (stillOnDisk) {
+			await sessionStore.save(session.currentSessionId, session.history);
+		} else {
+			resetSessionState(session);
+		}
 	};
 
 	// A single persistent listener aborts whichever run controller is current,
@@ -1368,6 +1517,30 @@ export async function runLlmLoop(
 			eventQueue.getMeta(LAST_REPLYABLE_TARGET_META_KEY) ?? event.source;
 		let currentTarget =
 			sourceDaemon?.manifest.replyable === true ? event.source : fallbackTarget;
+		// Assistant text goes out as each model response arrives (see
+		// ObservedModel), to whatever the delivery target is at that moment.
+		// The same text written again after a tool call is one reply, not two.
+		const sent = new Set<string>();
+		const deliver = (text: string): void => {
+			const trimmed = text.trim();
+			if (!trimmed || sent.has(trimmed)) return;
+			const targetDaemon = daemonsRef.current.find(
+				(d) => d.manifest.name === currentTarget,
+			);
+			if (targetDaemon?.manifest.replyable === true) {
+				sent.add(trimmed);
+				targetDaemon.peer.notify("event", {
+					type: "message.send.v1",
+					text: trimmed,
+				});
+			}
+		};
+		// Saves the history when each model response arrives (see
+		// ObservedModel). Assigned in the try below, once the run input exists.
+		let checkpoint: (
+			input: ModelRequest["input"],
+			output: AgentInputItem[],
+		) => Promise<void> = async () => {};
 
 		const restartModulesTool = tool({
 			name: "restart_modules",
@@ -1440,10 +1613,11 @@ export async function runLlmLoop(
 			tool({
 				name: "turn_end",
 				description:
-					"End the current turn immediately without sending any message to the user or any module. " +
-					"Use this when the task is complete and no reply is needed — for example after a background " +
+					"End the current turn immediately without adding a message. Text you already wrote earlier in this turn " +
+					"is still delivered, so you can write a reply alongside a tool call and then end with this. " +
+					"Use this when the task is complete and nothing more needs saying — for example after a background " +
 					"task, a timer event, or any event that requires action but not a user-facing response. " +
-					"Do NOT use this when you have something to say; emit free-form text instead.",
+					"Do NOT use this instead of saying something; emit free-form text for that.",
 				parameters: {
 					type: "object",
 					properties: {},
@@ -1674,6 +1848,11 @@ export async function runLlmLoop(
 			skills,
 		});
 		const agent = baseAgent.clone({
+			model: new ObservedModel(
+				resolveInnerModel,
+				(input, output) => checkpoint(input, output),
+				deliver,
+			),
 			tools,
 			instructions,
 			toolUseBehavior: (_context, toolResults: FunctionToolResult[]) => {
@@ -1718,8 +1897,8 @@ export async function runLlmLoop(
 		// The abortSignal may have fired while this iteration was blocked in
 		// `await eventQueue.next()`, before currentRunController pointed at it.
 		if (options?.abortSignal?.aborted) runController.abort();
-		// Snapshot so a dropped turn (save failure below) can be rolled back
-		// and not later persisted/replayed on a subsequent event.
+		// The history before this run. Checkpoints and the final save both append
+		// to it, because `session.history` changes while the run is in progress.
 		const historyBefore = session.history;
 		try {
 			// Build the LLM input inside the try so an invalid payload (e.g. a
@@ -1789,75 +1968,65 @@ export async function runLlmLoop(
 					: eventForInput.params.type === "event.v1"
 						? xml
 						: [userInput];
+			// Each model call's input is this run's input followed by everything
+			// the run has produced so far, every tool call paired with its result.
+			// Once a response arrives that input is known to be accepted, so it is
+			// saved together with the response's leading messages: a reply already
+			// sent stays in the history even if the run fails later. The tool calls
+			// of the response are saved with their results by the next response.
+			// The input keeps the first `modelHistory.length` items as they were;
+			// re-anchor on `historyBefore` as the final save does.
+			checkpoint = async (input, output) => {
+				const items =
+					typeof input === "string"
+						? [{ role: "user", content: input } as AgentInputItem]
+						: input;
+				session.history = sanitizeHistoryForStorage([
+					...historyBefore,
+					...items.slice(modelHistory.length),
+					...leadingMessages(output),
+				]);
+				await persistHistory();
+			};
 			const result = await runner.run(agent, runInput, {
 				signal: runController.signal,
 				maxTurns,
 			});
 			// A sessions.skip.v1 that aborted this run — including the narrow window
 			// where the run resolved just before the abort landed — must yield a
-			// dropped event, not a delivered reply. Past this point the run is
-			// committed: the controller is unregistered so a later skip is a no-op
-			// (the save/deliver window is intentionally not abortable).
+			// dropped event. What happened before the abort stays: text already
+			// delivered, and the history saved at the last model response. Past this
+			// point the run is committed: the controller is unregistered so a later
+			// skip is a no-op (the save window is intentionally not abortable).
 			if (runController.signal.aborted) {
 				notifyEventDropped(daemonsRef.current, event);
 				if (!isInterrupt) eventQueue.complete(event.id);
 				continue;
 			}
 			eventQueue.setRunController(null);
-			const text = result.finalOutput;
 			// `result.history` is the run's input verbatim, followed by the items the
 			// run generated (@openai/agents `getTurnInput`; only the generated tail
 			// is ever pruned). Storing it directly would write back the *filtered*
 			// input, erasing on this save the very reasoning the filter deliberately
 			// left on disk. Re-anchor on the unfiltered history and append only what
 			// this run added. When nothing was filtered `modelHistory` is
-			// `session.history`, so this reduces to `result.history` unchanged.
+			// `historyBefore`, so this reduces to `result.history` unchanged.
 			session.history = sanitizeHistoryForStorage([
-				...session.history,
+				...historyBefore,
 				...result.history.slice(modelHistory.length),
 			]);
-			if (sessionStore && session.currentSessionId !== null) {
-				// Re-check liveness immediately before writing. sessions.delete.v1
-				// removes the history file mid-run; the completing turn must not
-				// recreate it (spec: deleted sessions are never written again).
-				// active_session_id alone is insufficient because the delete removes
-				// the file before it clears that metadata, so also confirm the file
-				// still exists.
-				const stillActive =
-					session.currentSessionId ===
-					eventQueue.getMeta(ACTIVE_SESSION_META_KEY);
-				const stillOnDisk =
-					stillActive &&
-					(await sessionStore.load(session.currentSessionId)) !== null;
-				if (stillOnDisk) {
-					await sessionStore.save(session.currentSessionId, session.history);
-				} else {
-					resetSessionState(session);
-				}
-			}
-			// Deliver only after the session history is persisted, so a save
-			// failure (caught below) means nothing was delivered and the
-			// event.dropped.v1 path is not reporting an already-sent reply.
-			if (text?.trim()) {
-				const targetDaemon = daemonsRef.current.find(
-					(d) => d.manifest.name === currentTarget,
-				);
-				if (targetDaemon?.manifest.replyable === true) {
-					targetDaemon.peer.notify("event", {
-						type: "message.send.v1",
-						text,
-					});
-				}
-			}
+			await persistHistory();
 			if (!isInterrupt) eventQueue.complete(event.id);
 		} catch (error) {
 			console.error(
 				`[core] LLM cycle failed: ${error instanceof Error ? error.message : String(error)}`,
 			);
-			// The turn is dropped, so discard its in-memory history mutation;
-			// otherwise a failed save would still leave the turn to be persisted
-			// on a later event and re-processed after re-emit.
-			session.history = historyBefore;
+			// No rollback: the history keeps the turn up to its last model response,
+			// which includes every reply delivered. The tool calls of that response
+			// are not in it, since the provider never accepted their results. A
+			// turn whose final save failed stays in memory and is written by the
+			// next save. A module that re-emits the event after event.dropped.v1
+			// gets it processed again after that partial turn.
 			notifyEventDropped(daemonsRef.current, event);
 			if (!isInterrupt) eventQueue.complete(event.id);
 		} finally {

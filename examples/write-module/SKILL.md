@@ -441,7 +441,7 @@ Sent to the **current delivery target**, which may not be the module that owns t
 | `timestamp` | string | ISO 8601, when the event was received by the core |
 | `params` | object | Original event params as emitted, except the base64 `data` field is stripped from `image.send.v1` / `file.send.v1` events |
 
-The core does not retry delivery. Re-emitting the event is the module's responsibility. Because `data` is stripped from dropped `image.send.v1` / `file.send.v1` events, re-emit from your own pending store (Pattern 2) rather than from `params`.
+The core does not retry delivery. Re-emitting the event is the module's responsibility. Because `data` is stripped from dropped `image.send.v1` / `file.send.v1` events, re-emit from your own pending store (Pattern 2) rather than from `params`. A dropped cycle may already have written a partial turn to session history (replies sent, tools run); re-emitting processes the event again after that.
 
 ## Sessions API
 

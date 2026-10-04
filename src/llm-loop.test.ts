@@ -4,13 +4,23 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import type { Agent, AgentInputItem, Runner } from "@openai/agents";
+import type {
+	Agent,
+	AgentInputItem,
+	Model,
+	ModelRequest,
+	ModelResponse,
+	Runner,
+} from "@openai/agents";
 import type { FunctionTool } from "@openai/agents-core";
 import { RunContext } from "@openai/agents-core";
 import { EventQueue, timestampFromUUIDv7 } from "./event-queue";
 import {
+	assistantText,
 	downscaleImage,
 	dropReasoningItems,
+	leadingMessages,
+	ObservedModel,
 	resolveDropReasoningHistory,
 	resolveInputModalities,
 	resolveModelTimeoutMs,
@@ -111,6 +121,56 @@ function findFunctionTool(agent: Agent, name: string): FunctionTool {
 		throw new Error(`tool ${name} not found on agent`);
 	}
 	return found;
+}
+
+// A model whose every response is one assistant message with `text`,
+// followed by `extra` output items (a tool call, say).
+function fakeModel(text: string, extra: unknown[] = []): Model {
+	return {
+		getResponse: async () =>
+			({
+				output: [
+					{
+						type: "message",
+						role: "assistant",
+						status: "completed",
+						content: [{ type: "output_text", text }],
+					},
+					...extra,
+				],
+			}) as unknown as ModelResponse,
+		getStreamedResponse: async function* () {},
+	} as unknown as Model;
+}
+
+// Sequential responses, one assistant message each. Used to test a run that
+// writes text, calls a tool, then writes text again.
+function fakeModelQueue(texts: string[]): Model {
+	let i = 0;
+	return {
+		getResponse: async () => {
+			const text = texts[Math.min(i, texts.length - 1)] ?? "";
+			i++;
+			return {
+				output: [
+					{
+						type: "message",
+						role: "assistant",
+						status: "completed",
+						content: [{ type: "output_text", text }],
+					},
+				],
+			} as unknown as ModelResponse;
+		},
+		getStreamedResponse: async function* () {},
+	} as unknown as Model;
+}
+
+// One model call, the way the SDK makes it for each turn of a run.
+async function callModel(agent: Agent): Promise<ModelResponse> {
+	return (agent.model as Model).getResponse({
+		input: [],
+	} as unknown as ModelRequest);
 }
 
 describe("SessionStore", () => {
@@ -405,6 +465,137 @@ describe("dropReasoningItems", () => {
 	test("leaves a history without reasoning untouched", () => {
 		const history = [{ role: "user", content: "a" }] as AgentInputItem[];
 		expect(dropReasoningItems(history)).toEqual(history);
+	});
+});
+
+describe("assistantText", () => {
+	test("joins assistant text in order and skips everything else", () => {
+		const items = [
+			{ role: "user", content: "hi" },
+			{ type: "reasoning", content: [{ type: "reasoning_text", text: "r" }] },
+			{
+				type: "message",
+				role: "assistant",
+				content: [{ type: "output_text", text: "\n\nfirst" }],
+			},
+			{ type: "function_call", name: "memory__remember", arguments: "{}" },
+			{ role: "assistant", content: [{ type: "output_text", text: "  " }] },
+			{ role: "assistant", content: [{ type: "output_text", text: "second" }] },
+		];
+		expect(assistantText(items)).toBe("first\n\nsecond");
+	});
+
+	test("is empty when the items carry no assistant text", () => {
+		expect(assistantText([{ type: "function_call", name: "turn_end" }])).toBe(
+			"",
+		);
+	});
+});
+
+describe("leadingMessages", () => {
+	const reasoning = { type: "reasoning", content: [] };
+	const message = {
+		type: "message",
+		role: "assistant",
+		content: [{ type: "output_text", text: "reply" }],
+	};
+	const call = { type: "function_call", callId: "c1", name: "shell" };
+	const leading = (items: unknown[]): unknown[] =>
+		leadingMessages(items as AgentInputItem[]);
+
+	test("keeps reasoning and messages before the first tool call", () => {
+		expect(leading([reasoning, message, call])).toEqual([reasoning, message]);
+	});
+
+	test("drops reasoning left without the item that followed it", () => {
+		expect(leading([reasoning, call])).toEqual([]);
+		expect(leading([message, reasoning, call])).toEqual([message]);
+	});
+
+	test("keeps nothing after the first tool call", () => {
+		expect(leading([call, message])).toEqual([]);
+	});
+
+	test("keeps the whole output of a response without tool calls", () => {
+		expect(leading([reasoning, message])).toEqual([reasoning, message]);
+	});
+});
+
+describe("ObservedModel", () => {
+	test("runs onResponse with the input and output, then delivers the text", async () => {
+		const events: string[] = [];
+		const inner = {
+			getResponse: async () => {
+				events.push("model");
+				return (await fakeModel("reply", [
+					{ type: "function_call", name: "memory__remember", arguments: "{}" },
+				]).getResponse({} as ModelRequest)) as ModelResponse;
+			},
+		} as unknown as Model;
+		const model = new ObservedModel(
+			async () => inner,
+			async (input, output) => {
+				events.push(`response:${JSON.stringify(input)}:${output.length}`);
+			},
+			(text) => {
+				events.push(`deliver:${text}`);
+			},
+		);
+
+		const response = await model.getResponse({
+			input: [{ role: "user", content: "hi" }],
+		} as unknown as ModelRequest);
+
+		expect(events).toEqual([
+			"model",
+			'response:[{"role":"user","content":"hi"}]:2',
+			"deliver:reply",
+		]);
+		expect(response.output).toHaveLength(2);
+	});
+
+	test("neither saves nor delivers when the model call fails", async () => {
+		const events: string[] = [];
+		const inner = {
+			getResponse: async () => {
+				throw new Error("400 context length exceeded");
+			},
+		} as unknown as Model;
+		const model = new ObservedModel(
+			async () => inner,
+			async () => {
+				events.push("response");
+			},
+			() => {
+				events.push("deliver");
+			},
+		);
+
+		await expect(
+			model.getResponse({ input: [] } as unknown as ModelRequest),
+		).rejects.toThrow("400");
+		expect(events).toEqual([]);
+	});
+
+	test("delivers nothing for a response with only tool calls", async () => {
+		const delivered: string[] = [];
+		const inner = {
+			getResponse: async () =>
+				({
+					output: [
+						{ type: "function_call", name: "turn_end", arguments: "{}" },
+					],
+				}) as unknown as ModelResponse,
+		} as unknown as Model;
+		const model = new ObservedModel(
+			async () => inner,
+			async () => {},
+			(text) => delivered.push(text),
+		);
+
+		await model.getResponse({ input: [] } as unknown as ModelRequest);
+
+		expect(delivered).toEqual([]);
 	});
 });
 
@@ -2076,14 +2267,21 @@ describe("runLlmLoop", () => {
 					{ signal: opts.signal },
 				);
 				// The turn continues after the timeout and still produces a reply.
+				await callModel(agent);
 				return { finalOutput: "handled", history: [] };
 			},
 		} as unknown as Runner;
 
 		const loopTask = runLlmLoop(queue, { current: daemons }, "test-model", {
 			runner: mockRunner,
+			innerModel: fakeModel("handled"),
 		});
-		await waitUntil(() => notified.some((n) => n.type === "message.send.v1"));
+		// The reply can only arrive after the 1s tool timeout, so the wait must
+		// outlast it; the default 1s bound raced it.
+		await waitUntil(
+			() => notified.some((n) => n.type === "message.send.v1"),
+			5000,
+		);
 		queue.close();
 		await loopTask;
 
@@ -2100,6 +2298,138 @@ describe("runLlmLoop", () => {
 		expect(
 			(daemons[0] as unknown as { restartAttempts: number }).restartAttempts,
 		).toBe(2);
+	});
+
+	test("delivers text written alongside a tool call as the response arrives, once", async () => {
+		const home = await createTempDir("justclaw-llm-deliver-");
+		const dbPath = path.join(home, "events.db");
+		const queue = new EventQueue(dbPath);
+		queue.enqueue("srcmod", { type: "event.v1", kind: "test" });
+
+		const sent: string[] = [];
+		const daemons = [
+			{
+				manifest: { name: "srcmod", replyable: true },
+				tools: [],
+				peer: {
+					notify: (method: string, params: unknown) => {
+						const p = params as { type?: string; text?: string };
+						if (method === "event" && p.type === "message.send.v1") {
+							sent.push(p.text ?? "");
+						}
+					},
+					request: async () => ({}),
+				},
+			},
+		] as unknown as StartedDaemon[];
+
+		let sentDuringRun = -1;
+		const mockRunner = {
+			run: async (agent: Agent) => {
+				// One response carrying the reply and a tool call; the run then
+				// ends through turn_end, so finalOutput is empty.
+				await callModel(agent);
+				sentDuringRun = sent.length;
+				return { finalOutput: "", history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: daemons }, "test-model", {
+			runner: mockRunner,
+			innerModel: fakeModel("reply", [
+				{ type: "function_call", name: "turn_end", arguments: "{}" },
+			]),
+		});
+		await waitForQueueEmpty(dbPath);
+		queue.close();
+		await loopTask;
+
+		expect(sentDuringRun).toBe(1);
+		expect(sent).toEqual(["reply"]);
+	});
+
+	test("does not send the same reply twice in one run", async () => {
+		const home = await createTempDir("justclaw-llm-dedup-");
+		const dbPath = path.join(home, "events.db");
+		const queue = new EventQueue(dbPath);
+		queue.enqueue("srcmod", { type: "event.v1", kind: "test" });
+
+		const sent: string[] = [];
+		const daemons = [
+			{
+				manifest: { name: "srcmod", replyable: true },
+				tools: [],
+				peer: {
+					notify: (method: string, params: unknown) => {
+						const p = params as { type?: string; text?: string };
+						if (method === "event" && p.type === "message.send.v1") {
+							sent.push(p.text ?? "");
+						}
+					},
+					request: async () => ({}),
+				},
+			},
+		] as unknown as StartedDaemon[];
+
+		const mockRunner = {
+			run: async (agent: Agent) => {
+				await callModel(agent);
+				await callModel(agent);
+				return { finalOutput: "", history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: daemons }, "test-model", {
+			runner: mockRunner,
+			innerModel: fakeModelQueue(["reply", "\n\nreply"]),
+		});
+		await waitForQueueEmpty(dbPath);
+		queue.close();
+		await loopTask;
+
+		expect(sent).toEqual(["reply"]);
+	});
+
+	test("sends distinct replies from later responses in the same run", async () => {
+		const home = await createTempDir("justclaw-llm-distinct-");
+		const dbPath = path.join(home, "events.db");
+		const queue = new EventQueue(dbPath);
+		queue.enqueue("srcmod", { type: "event.v1", kind: "test" });
+
+		const sent: string[] = [];
+		const daemons = [
+			{
+				manifest: { name: "srcmod", replyable: true },
+				tools: [],
+				peer: {
+					notify: (method: string, params: unknown) => {
+						const p = params as { type?: string; text?: string };
+						if (method === "event" && p.type === "message.send.v1") {
+							sent.push(p.text ?? "");
+						}
+					},
+					request: async () => ({}),
+				},
+			},
+		] as unknown as StartedDaemon[];
+
+		const mockRunner = {
+			run: async (agent: Agent) => {
+				await callModel(agent);
+				await callModel(agent);
+				return { finalOutput: "", history: [] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: daemons }, "test-model", {
+			runner: mockRunner,
+			innerModel: fakeModelQueue(["looking it up", "it is 3pm"]),
+		});
+		await waitForQueueEmpty(dbPath);
+		queue.close();
+		await loopTask;
+
+		expect(sent).toEqual(["looking it up", "it is 3pm"]);
 	});
 
 	test("applies the model timeout to the agent", async () => {
@@ -2214,7 +2544,7 @@ describe("runLlmLoop", () => {
 		expect(types).not.toContain("message.send.v1");
 	});
 
-	test("rolls back in-memory history when the session save fails", async () => {
+	test("keeps a turn whose save failed so the next save writes it", async () => {
 		const home = await createTempDir("justclaw-llm-save-rollback-");
 		const dbPath = path.join(home, "events.db");
 		const active = "01900000-0000-7000-8000-0000000000aa";
@@ -2259,8 +2589,168 @@ describe("runLlmLoop", () => {
 		queue.close();
 		await loopTask;
 
-		// The second event must not carry the first turn, whose save failed.
-		expect(JSON.stringify(capturedInputs[1])).not.toContain("turn1");
+		// The first turn happened (replies may have gone out), so the second
+		// event carries it even though its save failed.
+		expect(JSON.stringify(capturedInputs[1])).toContain("turn1");
+	});
+
+	// A run over a real session store whose runner makes two model calls the
+	// way the SDK does: the first response is a reply plus a shell call, and
+	// the second call's input carries that response and the shell result.
+	// `outcome` picks how the run ends: normally, by throwing after both
+	// responses, or by the provider rejecting the first or second call.
+	type TwoCallOutcome =
+		| "succeed"
+		| "fail-after"
+		| "reject-first"
+		| "reject-second";
+	async function runTwoModelCalls(outcome: TwoCallOutcome): Promise<{
+		stored: AgentInputItem[];
+		sent: string[];
+		dropped: boolean;
+	}> {
+		const home = await createTempDir("justclaw-llm-checkpoint-");
+		const dbPath = path.join(home, "events.db");
+		const sessionStore = new SessionStore(path.join(home, "history"));
+		const sessionId = "01900000-0000-7000-8000-0000000000c1";
+		await sessionStore.save(sessionId, [
+			{ role: "user", content: "earlier" } as AgentInputItem,
+		]);
+		const queue = new EventQueue(dbPath);
+		queue.setMeta("active_session_id", sessionId);
+		queue.enqueue("srcmod", { type: "event.v1", kind: "test" });
+
+		const sent: string[] = [];
+		let dropped = false;
+		const daemons = [
+			{
+				manifest: { name: "srcmod", replyable: true },
+				tools: [],
+				peer: {
+					notify: (method: string, params: unknown) => {
+						const p = params as { type?: string; text?: string };
+						if (method !== "event") return;
+						if (p.type === "message.send.v1") sent.push(p.text ?? "");
+						if (p.type === "event.dropped.v1") dropped = true;
+					},
+					request: async () => ({}),
+				},
+			},
+		] as unknown as StartedDaemon[];
+
+		const firstOutput = [
+			{
+				type: "message",
+				role: "assistant",
+				status: "completed",
+				content: [{ type: "output_text", text: "reply" }],
+			},
+			{
+				type: "function_call",
+				callId: "c1",
+				name: "shell",
+				arguments: "{}",
+			},
+		] as unknown as AgentInputItem[];
+		const toolResult = {
+			type: "function_call_result",
+			callId: "c1",
+			name: "shell",
+			status: "completed",
+			output: { type: "text", text: "ran" },
+		} as unknown as AgentInputItem;
+		let calls = 0;
+		const innerModel = {
+			getResponse: async () => {
+				calls++;
+				if (
+					(calls === 1 && outcome === "reject-first") ||
+					(calls === 2 && outcome === "reject-second")
+				) {
+					throw new Error("400 context length exceeded");
+				}
+				return {
+					output: calls === 1 ? firstOutput : [],
+				} as unknown as ModelResponse;
+			},
+			getStreamedResponse: async function* () {},
+		} as unknown as Model;
+		const mockRunner = {
+			run: async (agent: Agent, input: unknown) => {
+				const model = agent.model as Model;
+				const asList = input as AgentInputItem[];
+				const generated = [...firstOutput, toolResult];
+				await model.getResponse({ input: asList } as unknown as ModelRequest);
+				await model.getResponse({
+					input: [...asList, ...generated],
+				} as unknown as ModelRequest);
+				if (outcome === "fail-after") throw new Error("run failed");
+				return { finalOutput: "", history: [...asList, ...generated] };
+			},
+		} as unknown as Runner;
+
+		const loopTask = runLlmLoop(queue, { current: daemons }, "test-model", {
+			runner: mockRunner,
+			sessionStore,
+			innerModel,
+		});
+		await waitForQueueEmpty(dbPath);
+		queue.close();
+		await loopTask;
+
+		const stored = await sessionStore.load(sessionId);
+		if (stored === null) throw new Error("session history missing");
+		return { stored, sent, dropped };
+	}
+
+	const countType = (items: AgentInputItem[], type: string) =>
+		items.filter((i) => (i as { type?: string }).type === type).length;
+
+	test("keeps what a failed run did up to its last model response", async () => {
+		const { stored, sent, dropped } = await runTwoModelCalls("fail-after");
+
+		expect(dropped).toBe(true);
+		expect(sent).toEqual(["reply"]);
+		const text = JSON.stringify(stored);
+		expect(text).toContain("earlier");
+		expect(text).toContain("reply");
+		// The second response accepted the shell result, so the next event
+		// sees that the tool ran.
+		expect(countType(stored, "function_call")).toBe(1);
+		expect(countType(stored, "function_call_result")).toBe(1);
+	});
+
+	test("does not store a tool result the provider rejected", async () => {
+		const { stored, sent, dropped } = await runTwoModelCalls("reject-second");
+
+		expect(dropped).toBe(true);
+		// The reply went out with the first response and is in the history,
+		// but the shell call and its result were never accepted.
+		expect(sent).toEqual(["reply"]);
+		expect(JSON.stringify(stored)).toContain("reply");
+		expect(countType(stored, "function_call")).toBe(0);
+		expect(countType(stored, "function_call_result")).toBe(0);
+	});
+
+	test("leaves the history untouched when the first call is rejected", async () => {
+		const { stored, sent, dropped } = await runTwoModelCalls("reject-first");
+
+		expect(dropped).toBe(true);
+		expect(sent).toEqual([]);
+		expect(stored).toEqual([
+			{ role: "user", content: "earlier" } as AgentInputItem,
+		]);
+	});
+
+	test("does not duplicate checkpointed items in the final save", async () => {
+		const { stored } = await runTwoModelCalls("succeed");
+
+		expect(countType(stored, "function_call")).toBe(1);
+		expect(countType(stored, "function_call_result")).toBe(1);
+		expect(countType(stored, "message")).toBe(1);
+		expect(
+			stored.filter((i) => (i as { role?: string }).role === "user"),
+		).toHaveLength(2);
 	});
 
 	test("does not recreate a session deleted mid-run before metadata clears", async () => {

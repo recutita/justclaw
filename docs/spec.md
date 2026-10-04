@@ -49,7 +49,7 @@ The LLM queue is serial, so an unbounded wait blocks every pending event, not ju
 
 | Bounded operation | Bound | On expiry |
 |---|---|---|
-| Model call | `JUSTCLAW_MODEL_TIMEOUT` (seconds, default `600`) | The LLM cycle fails like any other LLM error: `event.dropped.v1` goes to the source module, which decides whether to re-emit. |
+| Model call | `JUSTCLAW_MODEL_TIMEOUT` (seconds, default `600`) | The LLM cycle fails like any other LLM error: `event.dropped.v1` goes to the source module, which decides whether to re-emit. History already written for the turn stays (see [When history is saved](#when-history-is-saved)). |
 | Module tool call (`tool/{name}`) | `JUSTCLAW_TOOL_TIMEOUT` (seconds, default `60`) | The call returns `error: module did not respond within {n}s` to the LLM as that tool's result. The turn continues and `tool_call.v1` is still delivered. |
 | Sandbox process behind `create_file`, `edit_file`, `delete_file`, `attach_image`, `attach_file` | Fixed 30 seconds | The process is killed (SIGKILL) and the tool reports `timed out after 30s`. Output written before the kill is preserved. |
 
@@ -334,7 +334,7 @@ Deletes the history file for the given session. If no file exists for the id, th
 
 If the deleted id is currently active (persisted metadata), the core deletes `active_session_id` immediately. The core does not auto-switch during `sessions.delete.v1`; fallback adoption can happen later when the LLM loop needs a session for event processing.
 
-If a session is deleted while an LLM turn is in-flight, completion of that turn does not recreate the deleted session file. Deleted sessions are never written again.
+If a session is deleted while an LLM turn is in-flight, later writes of that turn do not recreate the deleted session file — neither the per-response writes nor the completing save (see [When history is saved](#when-history-is-saved)). Deleted sessions are never written again.
 
 Request:
 
@@ -381,7 +381,7 @@ Response:
 
 ### `sessions.skip.v1`
 
-Aborts the currently running LLM cycle by signaling its abort controller. If no run is active, returns `"no-op"` and nothing else happens. The skip request itself only signals the abort; the aborted cycle is then torn down by the LLM loop's normal abort handling, which delivers `event.dropped.v1` to the source and removes the event from the queue (the same path used for any LLM-failure drop). Delivery and removal therefore happen asynchronously, after the request has returned, not within the skip handler.
+Aborts the currently running LLM cycle by signaling its abort controller. If no run is active, returns `"no-op"` and nothing else happens. The skip request itself only signals the abort; the aborted cycle is then torn down by the LLM loop's normal abort handling, which delivers `event.dropped.v1` to the source and removes the event from the queue (the same path used for any LLM-failure drop). Delivery and removal therefore happen asynchronously, after the request has returned, not within the skip handler. What the aborted run already wrote to history stays; the skip does not roll the session back (see [When history is saved](#when-history-is-saved)). Text already delivered stays delivered (see [`message.send.v1`](#messagesendv1)).
 
 Combine with `sessions.interrupt.v1` for immediate effect: set the interrupt slot, then call `sessions.skip.v1` to abort the current run. The loop picks up the interrupt slot as the next event instead of pulling from the queue.
 
@@ -421,6 +421,32 @@ The core does not bound a session's history by size, age, or token count. A sess
 
 Capping and compacting history is deliberately left as agent policy, not core mechanism. The core's contribution is two primitives: sessions (`sessions.new.v1`, `sessions.switch.v1`) and `MEMORY.md`, a character-directory file re-read from disk before every turn (see [Character files](#character-files)). The expected operating model built on top of those primitives: the agent summarizes durable facts (user preferences, ongoing project state, anything worth keeping beyond the current conversation) into `MEMORY.md`, or hands them to a dedicated module for storage, since both persist independently of any one session's history. When a session's history has grown large enough to warrant a reset, the agent starts a new session with `sessions.new.v1` and activates it with `sessions.switch.v1`, rather than continuing to grow the old session indefinitely.
 
+### When history is saved
+
+The core writes the active session's history file each time a model response arrives during a run, and once more when the run completes successfully. Each per-response write stores the input of the call that produced the response, followed by the response's leading assistant messages: its items before the first tool call, without reasoning left at the end of them. The input is the run's input followed by everything the run has produced so far, with each tool call paired with its result.
+
+The write waits for the response because a response is the only proof that the provider accepted the input. Writing an input before the call would let one the provider rejects into the history: a tool result past the context window, or an image the provider refuses. Every later event in the session would then send it again and fail the same way, until the session is switched. A write only at the end of the run would lose a reply already sent if the run later failed.
+
+The response's tool calls are not written with it: their results do not exist yet, and a call without its result is rejected on the next request. Reasoning that preceded a tool call is held back with the call, because the Responses API rejects a reasoning item sent without the item that followed it. Both are written by the next response, as part of its input.
+
+```
+response 1: text "Noted." + call memory__remember
+  -> write the run input + "Noted."
+  -> message.send.v1 "Noted."            (before the tool runs)
+  -> tool runs
+response 2: call turn_end
+  -> write the run input + "Noted." + call + result
+  -> run ends; write the full turn
+```
+
+If model call 2 had failed instead, the history would keep the run input and "Noted.", but not the `memory__remember` call: the tool ran, but its result was never accepted by the provider.
+
+Every write rebuilds the stored history from the unfiltered history as it stood before this run, plus only the items the run has added since — the same re-anchoring described under [Reasoning in session history](#reasoning-in-session-history). File and audio byte payloads are replaced with `omitted: "data"` on every write.
+
+A run that fails or is skipped (`sessions.skip.v1`) after a write still yields `event.dropped.v1`; history already written stays. There is no rollback. A run whose first model call fails writes nothing. A write that itself fails leaves the turn in memory so the next write persists it. A module that re-emits the event after `event.dropped.v1` therefore sees it processed again after that partial turn.
+
+If the session is deleted mid-run, neither a per-response write nor the completing write recreates the file (see [`sessions.delete.v1`](#sessionsdeletev1)).
+
 ### Reasoning in session history
 
 Models that emit reasoning have those items stored in the session history alongside messages and tool calls. Within a single event they are always replayed: a tool-calling chain requires the reasoning that preceded each call, and removing it mid-chain breaks the run.
@@ -440,7 +466,7 @@ history/{id}.json   every reasoning item, always
           model input
 ```
 
-This is the only place where the persisted history and the input sent to the model intentionally differ. The two must not be "reconciled": the divergence is what preserves the audit trail. Concretely, the stored history is rebuilt from the unfiltered history plus the items the run generated, rather than from the run result directly — writing the run result back would erase the withheld reasoning from disk on the next save.
+This is the only place where the persisted history and the input sent to the model intentionally differ. The two must not be "reconciled": the divergence is what preserves the audit trail. Concretely, every write (the per-response writes and the completing save; see [When history is saved](#when-history-is-saved)) rebuilds the stored history from the unfiltered history plus the items the run has added, rather than from the model input or the run result directly — writing either back would erase the withheld reasoning from disk on the next save.
 
 ## Lifecycle (daemon)
 
@@ -683,6 +709,20 @@ The core sends notifications to modules using `method: "event"` with a versioned
 
 The core delivers outbound LLM-generated messages to modules via `message.send.v1`.
 
+One notification is sent per model response that contains assistant text, as soon as that response arrives and before the tools it calls run. This includes text the model writes in the same response as a tool call: a run that ends through `turn_end` still delivers the text of its earlier responses. Text parts within one response are joined with a blank line. A later response whose assistant text is the same (after trimming) as text already sent in this run is not sent again: writing the reply, calling a tool, then writing the same reply is one message. The notification goes to the delivery target current at that moment (see [Auto-routing](#auto-routing)), and only when that module is replyable.
+
+```
+response 1: text "Noted." + call memory__remember
+  -> message.send.v1 "Noted."            (before the tool runs)
+  -> tool_call.v1 memory__remember
+response 2: text "Noted."
+  -> not sent (same text as response 1)
+response 3: call turn_end
+  -> run ends; nothing more is sent
+```
+
+Delivery does not wait for the run to finish. The text is written to history just before it is sent, unless the response places it after a tool call; then the next response writes it (see [When history is saved](#when-history-is-saved)). A run that fails or is skipped (`sessions.skip.v1`) after a response was delivered still yields `event.dropped.v1`; text already sent stays sent.
+
 ```json
 {
   "jsonrpc": "2.0",
@@ -736,10 +776,10 @@ The core notifies the source module when it **consumes an event for an LLM cycle
 That includes at least:
 
 - **Restart recovery:** the previous process exited while one or more events were still marked `running` in the queue (the LLM cycle had started but never finished).
-- **LLM failure:** the runner throws or otherwise fails after the event was consumed and before the cycle would have completed successfully. This includes a model call that exceeds `JUSTCLAW_MODEL_TIMEOUT` (see [Timeouts](#timeouts)).
+- **LLM failure:** the runner throws or otherwise fails after the event was consumed and before the cycle would have completed successfully. This includes a model call that exceeds `JUSTCLAW_MODEL_TIMEOUT` (see [Timeouts](#timeouts)). History already written for the turn stays (see [When history is saved](#when-history-is-saved)).
 - **No adoptable session:** a session store is configured, the event was consumed from the queue, but no session could be adopted (no readable UUID `{id}.json` files on disk yet and no `sessions.switch.v1` applied before this event in the loop).
 
-**Delivery guarantee: at-least-once, not exactly-once.** `event.dropped.v1` is a best-effort signal that the LLM cycle *may* not have completed normally — it is not proof that it didn't. Restart recovery in particular cannot distinguish "the process exited before the cycle finished" from "the process exited after the cycle finished but before the queue row was marked complete": the row stays `running` until the core finishes marking it complete, and a crash in that narrow window leaves the row `running` on disk even though the cycle already ran to completion (for example, a reply was already delivered). Stale-row recovery on the next start has no way to tell the two cases apart, so it sends `event.dropped.v1` either way. A module that reacts by re-emitting the event can therefore cause it to be processed twice. Modules for which that matters must dedupe on re-emit — for example, by attaching an idempotency key to the event and having whatever consumes a redelivery (the module itself, or a downstream system) ignore a repeat of the same key.
+**Delivery guarantee: at-least-once, not exactly-once.** `event.dropped.v1` is a best-effort signal that the LLM cycle *may* not have completed normally — it is not proof that it didn't. Restart recovery in particular cannot distinguish "the process exited before the cycle finished" from "the process exited after the cycle finished but before the queue row was marked complete": the row stays `running` until the core finishes marking it complete, and a crash in that narrow window leaves the row `running` on disk even though the cycle already ran to completion (for example, a reply was already delivered). Stale-row recovery on the next start has no way to tell the two cases apart, so it sends `event.dropped.v1` either way. A module that reacts by re-emitting the event can therefore cause it to be processed twice. The same is true of a drop after a partial turn: replies may already have been sent, tools may already have run, and the event is already in history, so a re-emit appends it again. Modules for which that matters must dedupe on re-emit — for example, by attaching an idempotency key to the event and having whatever consumes a redelivery (the module itself, or a downstream system) ignore a repeat of the same key.
 
 In all cases the notification shape is the same.
 
@@ -840,7 +880,7 @@ route_message(module: string, text: string)
 
 The core forwards this as a `message.send.v1` notification to the named module only when that module's manifest has `replyable: true` and differs from the current delivery target; otherwise the tool returns an error. On success, the core sets the transient delivery-target override (see [Transient override](#transient-override)) to the named module for the rest of the current cycle. It does not modify the persisted `last_replyable_target`.
 
-Trailing free-form assistant text after the LLM run is delivered the same way: only when the current delivery target module is replyable.
+Free-form assistant text is delivered the same way, one notification per model response as described in [`message.send.v1`](#messagesendv1): only when the current delivery target module is replyable. Text in the same response as a `route_message` call is delivered before that call runs, so it goes to the target that was current before the override.
 
 ### Built-in Tool: `restart_modules`
 
@@ -954,13 +994,13 @@ After each invocation the core emits a `tool_call.v1` notification to the curren
 
 ### Built-in Tool: `turn_end`
 
-End the current LLM turn immediately without delivering any message. The SDK's agent loop cannot terminate without text output from the model; `turn_end` provides an explicit escape hatch via `toolUseBehavior`.
+End the current LLM turn immediately without adding a message. The SDK's agent loop cannot terminate without text output from the model; `turn_end` provides an explicit escape hatch via `toolUseBehavior`.
 
 ```
 turn_end()
 ```
 
-No parameters. On invocation the core sets `isFinalOutput: true` with an empty `finalOutput`, ending the run. No `message.send.v1` is delivered.
+No parameters. On invocation the core sets `isFinalOutput: true` with an empty `finalOutput`, ending the run. `turn_end` itself adds no `message.send.v1`; text the model wrote in the run's responses, including the response that called `turn_end`, was already delivered as each response arrived (see [`message.send.v1`](#messagesendv1)).
 
 Use this when the task is complete and no reply is needed — for example after handling a timer event or completing a background task silently.
 
