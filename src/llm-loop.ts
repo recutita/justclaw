@@ -9,6 +9,7 @@ import {
 	type ModelResponse,
 	type ModelRetryAdvice,
 	type ModelRetryAdviceRequest,
+	type ModelSettings,
 	OpenAIProvider,
 	Runner,
 	type StreamEvent,
@@ -190,6 +191,30 @@ function resolveTimeoutMs(name: string, defaultSeconds: number): number {
  */
 export function resolveModelTimeoutMs(): number {
 	return resolveTimeoutMs("JUSTCLAW_MODEL_TIMEOUT", 600);
+}
+
+/**
+ * Extra fields for every model request, as a JSON object. They carry settings
+ * that belong to the provider rather than to justclaw, such as
+ * `{"reasoning":{"effort":"medium"}}` or vLLM's `chat_template_kwargs`.
+ */
+export function resolveExtraBody(): Record<string, unknown> | undefined {
+	const raw = process.env.JUSTCLAW_OPENAI_EXTRA_BODY;
+	if (raw === undefined || raw === "") {
+		return undefined;
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		parsed = undefined;
+	}
+	if (!isRecord(parsed)) {
+		throw new Error(
+			`JUSTCLAW_OPENAI_EXTRA_BODY must be a JSON object, got ${JSON.stringify(raw)}`,
+		);
+	}
+	return parsed;
 }
 
 /**
@@ -1349,16 +1374,25 @@ export async function runLlmLoop(
 			: new OpenAIProvider().getModel(model);
 		return innerModel;
 	};
+	const extraBody = resolveExtraBody();
+	const modelSettings: ModelSettings = {
+		// The SDK rejects timeoutMs <= 0, so an unbounded configuration omits the
+		// setting rather than passing 0.
+		...(modelTimeoutMs > 0 ? { timeoutMs: modelTimeoutMs } : {}),
+		// The SDK merges providerData into the top level of every request body.
+		// When its default model is a GPT-5 variant, the runner strips reasoning
+		// settings from it for a model it identifies by a non-GPT-5 name. The
+		// agent's model is an ObservedModel instance, not a name, so they still
+		// reach the request; a test pins this against a real Runner.
+		...(extraBody ? { providerData: extraBody } : {}),
+	};
 	const baseAgent = new Agent({
 		name: "justclaw",
 		model,
 		instructions: "",
 		tools: [],
-		// The SDK rejects timeoutMs <= 0, so an unbounded configuration omits the
-		// setting rather than passing 0. clone() below carries modelSettings over.
-		...(modelTimeoutMs > 0
-			? { modelSettings: { timeoutMs: modelTimeoutMs } }
-			: {}),
+		// clone() below carries modelSettings over.
+		...(Object.keys(modelSettings).length > 0 ? { modelSettings } : {}),
 	});
 
 	const session = {
