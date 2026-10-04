@@ -125,6 +125,17 @@ export function resolveModelConfig(): string {
 		new OpenAI({
 			apiKey,
 			...(baseURL !== undefined && baseURL !== "" ? { baseURL } : {}),
+			// JUSTCLAW_MODEL_TIMEOUT (the SDK's timeoutMs) is the only bound on a
+			// model call. Both layers below would otherwise cut the request first
+			// (Bun's fetch at 300 s, openai-node at 10 min), and openai-node
+			// retries such a cut silently while the server goes on generating
+			// the abandoned request. Seven days rather than setTimeout's maximum
+			// (about 24.8 days): openai-node recomputes the body-read deadline
+			// from Date.now(), so a wall clock stepping back pushes the delay
+			// past that maximum, where setTimeout fires after 1 ms and the
+			// request is resent.
+			timeout: 7 * 24 * 60 * 60 * 1000,
+			fetchOptions: { timeout: false },
 		}),
 	);
 	setOpenAIAPI(api);
