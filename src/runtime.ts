@@ -14,6 +14,7 @@ import {
 } from "./module-manifest";
 import {
 	createSessionRequestHandler,
+	logModuleStderr,
 	parseEventNotificationParams,
 } from "./module-peer";
 import { createSandboxLaunchSpec, type SandboxLaunchSpec } from "./sandbox";
@@ -332,7 +333,7 @@ async function pipeStdout(
 async function pipeStderr(daemon: StartedDaemon): Promise<void> {
 	try {
 		await consumeLines(daemon.process.stderr, (line) => {
-			console.error(`[${daemon.manifest.name}] ${line}`);
+			logModuleStderr(daemon.manifest.name, line);
 		});
 	} catch (error) {
 		console.error(
