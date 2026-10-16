@@ -24,6 +24,7 @@ import {
 	loadAgentContext,
 	loadHomeAgentsFile,
 	loadSkillsIndex,
+	type ReadAgentFile,
 	readInitContent,
 } from "./agent-context";
 import { notifyDropped, notifyEventDropped } from "./event-dropped";
@@ -1220,6 +1221,8 @@ export type LlmLoopOptions = {
 	workspaceDir?: string;
 	historyDir?: string;
 	characterDir?: string;
+	/** Required with characterDir or skillsDir; see {@link ReadAgentFile}. */
+	readAgentFile?: ReadAgentFile;
 	contextInstructions?: string;
 	homeDir?: string;
 	modulesRoot?: string;
@@ -1365,6 +1368,19 @@ export async function runLlmLoop(
 	const modelTimeoutMs = resolveModelTimeoutMs();
 	const toolTimeoutMs = resolveToolTimeoutMs();
 	const sessionStore = options?.sessionStore;
+	const readAgentFile = options?.readAgentFile;
+	// No host-side fallback: reading agent-written files outside the sandbox is
+	// exactly what ReadAgentFile exists to prevent.
+	if ((options?.characterDir || options?.skillsDir) && !readAgentFile) {
+		throw new Error(
+			"runLlmLoop: characterDir and skillsDir require readAgentFile",
+		);
+	}
+	const characterDir = options?.characterDir;
+	const readInit =
+		characterDir && readAgentFile
+			? () => readInitContent(characterDir, readAgentFile)
+			: undefined;
 	// Resolved on the first model call and shared across events, so starting
 	// the loop needs no API client (tests drive it with a mock runner).
 	let innerModel: Promise<Model> | undefined;
@@ -1512,8 +1528,8 @@ export async function runLlmLoop(
 				);
 				// Fires once when a new empty session is first adopted at bootstrap.
 				// Explicit-switch cases are handled in sessions.switch.v1 before "ok" is returned.
-				if (adopted && session.history.length === 0 && options?.characterDir) {
-					const initText = await readInitContent(options.characterDir);
+				if (adopted && session.history.length === 0 && readInit) {
+					const initText = await readInit();
 					if (initText) {
 						eventQueue.enqueue(event.source, {
 							type: "event.v1",
@@ -1607,9 +1623,9 @@ export async function runLlmLoop(
 						initializeTimeoutMs: options.initializeTimeoutMs,
 						abortSignal: options.abortSignal,
 						timerSchedulerRef: options.timerSchedulerRef,
-						// Without characterDir the reloaded daemons' session-request
+						// Without readInit the reloaded daemons' session-request
 						// handlers stop injecting INIT.md for new sessions.
-						characterDir: options.characterDir,
+						readInit,
 					});
 					const rawContinuation =
 						(input as { continuation: string }).continuation ?? "";
@@ -1842,9 +1858,10 @@ export async function runLlmLoop(
 		const operatorContext = options?.homeDir
 			? await loadHomeAgentsFile(options.homeDir)
 			: undefined;
-		const characterContext = options?.characterDir
-			? await loadAgentContext(options.characterDir)
-			: options?.contextInstructions;
+		const characterContext =
+			characterDir && readAgentFile
+				? await loadAgentContext(characterDir, readAgentFile)
+				: options?.contextInstructions;
 		// Operator instructions live in a fixed file the agent cannot edit, so they
 		// get their own tag distinct from the editable character files. The fence
 		// labels origin only — content is not escaped, so a character file can emit
@@ -1865,9 +1882,10 @@ export async function runLlmLoop(
 			replyable: d.manifest.replyable,
 			tools: d.tools.map((t) => t.name),
 		}));
-		const skills = options?.skillsDir
-			? await loadSkillsIndex(options.skillsDir)
-			: undefined;
+		const skills =
+			options?.skillsDir && readAgentFile
+				? await loadSkillsIndex(options.skillsDir, readAgentFile)
+				: undefined;
 		const instructions = buildSystemPrompt({
 			contextInstructions,
 			workspaceDir: options?.workspaceDir,

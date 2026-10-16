@@ -9,6 +9,7 @@ import {
 	type Tool,
 	tool,
 } from "@openai/agents";
+import type { ReadAgentFile } from "./agent-context";
 import { createWorkspaceSandboxBaseCommand } from "./sandbox";
 
 export function resolveWorkspaceDir(
@@ -375,6 +376,56 @@ export async function runReadFileBase64(
 		timedOut: result.timedOut,
 		content: result.stdout.replace(/\r?\n/g, ""),
 		stderr: result.timedOut ? FILE_TOOL_TIMEOUT_MESSAGE : result.stderr,
+	};
+}
+
+// Caps what one agent-written file can put into core memory: the agent can
+// symlink it to /dev/zero, and runSandboxed collects all output. Prompt text
+// beyond this size is unusable anyway.
+const AGENT_FILE_MAX_BYTES = 1024 * 1024;
+
+/**
+ * Builds the {@link ReadAgentFile} the bundled entrypoint uses: each read runs
+ * `head` inside the workspace sandbox. The modules root is not mounted because
+ * none of the files read this way live there; a symlink into it reads as absent.
+ */
+export function createSandboxedFileReader(
+	workspaceDir: string,
+	historyDir: string,
+	platform: NodeJS.Platform = process.platform,
+	characterDir?: string,
+	skillsDir?: string,
+): ReadAgentFile {
+	return async (absPath) => {
+		const spec = await createWorkspaceSandboxBaseCommand(
+			workspaceDir,
+			historyDir,
+			{ platform, characterDir, skillsDir },
+		);
+		// One byte past the cap distinguishes a file of exactly the cap from a
+		// truncated one.
+		const result = await runSandboxed({
+			cmd: [
+				...spec.cmdPrefix,
+				"head",
+				"-c",
+				String(AGENT_FILE_MAX_BYTES + 1),
+				absPath,
+			],
+			cwd: workspaceDir,
+			env: spec.env,
+		});
+		if (result.timedOut || result.exitCode !== 0) {
+			return null;
+		}
+		const bytes = Buffer.from(result.stdout);
+		if (bytes.length > AGENT_FILE_MAX_BYTES) {
+			console.error(
+				`[core] ${absPath} exceeds ${AGENT_FILE_MAX_BYTES} bytes; using the first ${AGENT_FILE_MAX_BYTES}`,
+			);
+			return bytes.subarray(0, AGENT_FILE_MAX_BYTES).toString("utf8");
+		}
+		return result.stdout;
 	};
 }
 

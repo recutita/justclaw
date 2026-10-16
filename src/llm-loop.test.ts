@@ -19,6 +19,7 @@ import {
 import type { FunctionTool } from "@openai/agents-core";
 import { RunContext } from "@openai/agents-core";
 import OpenAI from "openai";
+import type { ReadAgentFile } from "./agent-context";
 import { EventQueue, timestampFromUUIDv7 } from "./event-queue";
 import {
 	assistantText,
@@ -37,6 +38,16 @@ import {
 import { type StartedDaemon, stopDaemons } from "./runtime";
 import { buildRuntimeInstructions } from "./runtime-prompt";
 import { SessionStore } from "./session-store";
+
+// Tests read character files from the host; production reads them inside the
+// workspace sandbox (see createSandboxedFileReader).
+const readHostFile: ReadAgentFile = async (p) => {
+	try {
+		return await Bun.file(p).text();
+	} catch {
+		return null;
+	}
+};
 
 const hasBwrap = Boolean(Bun.which("bwrap"));
 // attach_image/attach_file read through the workspace sandbox, so only run
@@ -744,6 +755,7 @@ describe("runLlmLoop", () => {
 			workspaceDir: "/tmp/ws",
 			historyDir: "/tmp/hist",
 			characterDir,
+			readAgentFile: readHostFile,
 			modulesRoot: "/tmp/mods",
 		});
 		await delay(80);
@@ -925,6 +937,7 @@ describe("runLlmLoop", () => {
 			workspaceDir: "/tmp/ws",
 			historyDir: "/tmp/hist",
 			characterDir: home,
+			readAgentFile: readHostFile,
 			modulesRoot: "/tmp/mods",
 		});
 		await waitForQueueEmpty(dbPath);
@@ -2925,7 +2938,7 @@ describe("runLlmLoop", () => {
 		);
 		// On first initialize the module creates a new session and switches to
 		// it. The core's session-request handler injects INIT.md only when it was
-		// started with characterDir, which restart_modules must forward.
+		// started with readInit, which restart_modules must forward.
 		const moduleScript = `#!/usr/bin/env bun
 const pending = new Map();
 let nextId = 100;
@@ -2980,7 +2993,7 @@ for await (const chunk of Bun.stdin.stream()) {
 		// A non-empty active session, so the loop's own bootstrap INIT injection
 		// (which fires only for an empty adopted session) stays quiet. The only
 		// remaining INIT source is the reloaded module's sessions.switch.v1
-		// handler, which needs characterDir forwarded through restart_modules.
+		// handler, which needs readInit forwarded through restart_modules.
 		const primedSession = "01900000-0000-7000-8000-0000000000aa";
 		await sessionStore.save(primedSession, [
 			{ role: "user", content: "primed" } as AgentInputItem,
@@ -3013,6 +3026,7 @@ for await (const chunk of Bun.stdin.stream()) {
 			sessionStore,
 			modulesRoot,
 			characterDir,
+			readAgentFile: readHostFile,
 			sandboxFactory: async (manifest) => ({
 				backend: "sandbox-exec" as const,
 				cmd: [manifest.execPath],

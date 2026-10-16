@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createWorkspaceSandboxBaseCommand } from "./sandbox";
 import {
+	createSandboxedFileReader,
 	resolveWorkspaceDir,
 	runReadFileBase64,
 	runSandboxed,
@@ -284,4 +285,68 @@ describe("runSandboxed", () => {
 			expect(Date.now() - started).toBeLessThan(10_000);
 		},
 	);
+});
+
+describe("createSandboxedFileReader", () => {
+	test.skipIf(!hasSandbox)(
+		"reads a character file and reports a missing one as null",
+		async () => {
+			const root = await createTempDir("justclaw-ws-");
+			const characterDir = await createTempDir("justclaw-ch-");
+			await writeFile(path.join(characterDir, "SOUL.md"), "soul");
+			const read = createSandboxedFileReader(
+				root,
+				historyDirForWorkspace(root),
+				process.platform,
+				characterDir,
+			);
+			expect(await read(path.join(characterDir, "SOUL.md"))).toBe("soul");
+			expect(await read(path.join(characterDir, "USER.md"))).toBeNull();
+		},
+	);
+
+	test.skipIf(!hasSandbox)(
+		"does not follow a symlink to a host file outside the sandbox mounts",
+		async () => {
+			// Regression: the core read character files on the host, so the agent
+			// could symlink USER.md to e.g. ~/.ssh/id_ed25519 and get its contents
+			// into the system prompt.
+			const root = await createTempDir("justclaw-ws-");
+			const characterDir = await createTempDir("justclaw-ch-");
+			const secretDir = await mkdtemp(
+				path.join(process.cwd(), ".justclaw-secret-"),
+			);
+			tempDirs.push(secretDir);
+			const secretPath = path.join(secretDir, "id_ed25519");
+			await writeFile(secretPath, "PRIVATE KEY");
+			await symlink(secretPath, path.join(characterDir, "USER.md"));
+			const read = createSandboxedFileReader(
+				root,
+				historyDirForWorkspace(root),
+				process.platform,
+				characterDir,
+			);
+			expect(await read(path.join(characterDir, "USER.md"))).toBeNull();
+		},
+	);
+
+	test.skipIf(!hasSandbox)("caps a symlink to /dev/zero at 1 MiB", async () => {
+		const root = await createTempDir("justclaw-ws-");
+		const characterDir = await createTempDir("justclaw-ch-");
+		await symlink("/dev/zero", path.join(characterDir, "MEMORY.md"));
+		const read = createSandboxedFileReader(
+			root,
+			historyDirForWorkspace(root),
+			process.platform,
+			characterDir,
+		);
+		const originalConsoleError = console.error;
+		console.error = () => {};
+		try {
+			const content = await read(path.join(characterDir, "MEMORY.md"));
+			expect(content?.length).toBe(1024 * 1024);
+		} finally {
+			console.error = originalConsoleError;
+		}
+	});
 });

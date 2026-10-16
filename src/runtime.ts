@@ -55,7 +55,8 @@ export type BootstrapRuntimeOptions = {
 	) => Promise<SandboxLaunchSpec>;
 	startedDaemons?: StartedDaemon[];
 	sessionStore: SessionStore;
-	characterDir?: string;
+	/** Returns INIT.md text to inject when a module switches to a new empty session. */
+	readInit?: () => Promise<string | null>;
 };
 
 type DaemonFailureHandler = (daemon: StartedDaemon, error: Error) => void;
@@ -348,7 +349,7 @@ function createPeer(
 	sessionStore: SessionStore,
 	daemons: StartedDaemon[],
 	self: { daemon?: StartedDaemon },
-	characterDir?: string,
+	readInit?: () => Promise<string | null>,
 ): JsonRpcPeer {
 	return new JsonRpcPeer({
 		name: manifest.name,
@@ -381,7 +382,7 @@ function createPeer(
 			manifest.name,
 			queue,
 			sessionStore,
-			characterDir,
+			readInit,
 			{ current: daemons },
 		),
 	});
@@ -425,7 +426,7 @@ export async function startDaemon(
 		| "sandboxFactory"
 		| "initializeTimeoutMs"
 		| "sessionStore"
-		| "characterDir"
+		| "readInit"
 	> & {
 		onSpawned?: (daemon: StartedDaemon) => void;
 		onFailure?: DaemonFailureHandler;
@@ -457,7 +458,7 @@ export async function startDaemon(
 		options.sessionStore,
 		options.daemons ?? [],
 		self,
-		options.characterDir,
+		options.readInit,
 	);
 	const daemon: StartedDaemon = {
 		manifest,
@@ -552,7 +553,7 @@ function superviseDaemon(
 		| "sandboxFactory"
 		| "initializeTimeoutMs"
 		| "sessionStore"
-		| "characterDir"
+		| "readInit"
 	>,
 	daemons: StartedDaemon[],
 	eventQueue: EventQueue,
@@ -577,7 +578,7 @@ function handleDaemonFailure(
 		| "sandboxFactory"
 		| "initializeTimeoutMs"
 		| "sessionStore"
-		| "characterDir"
+		| "readInit"
 	>,
 	daemons: StartedDaemon[],
 	eventQueue: EventQueue,
@@ -639,7 +640,7 @@ async function restartFailedDaemon(
 		| "sandboxFactory"
 		| "initializeTimeoutMs"
 		| "sessionStore"
-		| "characterDir"
+		| "readInit"
 	>,
 	daemons: StartedDaemon[],
 	eventQueue: EventQueue,
@@ -703,7 +704,7 @@ async function restartFailedDaemon(
 			sandboxFactory: options.sandboxFactory,
 			queue: eventQueue,
 			sessionStore: options.sessionStore,
-			characterDir: options.characterDir,
+			readInit: options.readInit,
 			daemons,
 			onFailure: (failedDaemon, failureError) => {
 				handleDaemonFailure(
@@ -749,7 +750,7 @@ export async function reloadModules(
 		| "sandboxFactory"
 		| "initializeTimeoutMs"
 		| "sessionStore"
-		| "characterDir"
+		| "readInit"
 	> & {
 		timerSchedulerRef?: { current: TimerScheduler };
 	},
@@ -780,7 +781,7 @@ export async function reloadModules(
 					sandboxFactory: options.sandboxFactory,
 					queue: eventQueue,
 					sessionStore: options.sessionStore,
-					characterDir: options.characterDir,
+					readInit: options.readInit,
 					daemons: daemonsRef.current,
 					onFailure: (daemon, error) => {
 						handleDaemonFailure(
@@ -826,7 +827,7 @@ export async function reloadModules(
 			options.sessionStore,
 			{
 				initializeTimeoutMs: options.initializeTimeoutMs,
-				characterDir: options.characterDir,
+				readInit: options.readInit,
 			},
 		);
 		console.error(
@@ -865,7 +866,7 @@ export async function bootstrapRuntime(
 			sandboxFactory: options.sandboxFactory,
 			initializeTimeoutMs: options.initializeTimeoutMs,
 			sessionStore: options.sessionStore,
-			characterDir: options.characterDir,
+			readInit: options.readInit,
 		});
 
 		for (const event of eventQueue.stale()) {
@@ -886,7 +887,7 @@ export async function bootstrapRuntime(
 			timerManifests,
 			eventQueue,
 			options.sessionStore,
-			{ characterDir: options.characterDir },
+			{ readInit: options.readInit },
 		);
 		console.error(
 			`[core] started: ${startupRef.current.length} daemon(s), ${timerManifests.length} timer(s)`,

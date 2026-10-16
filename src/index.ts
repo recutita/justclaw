@@ -1,6 +1,10 @@
 import { mkdirSync } from "node:fs";
 import path from "node:path";
-import { resolveCharacterDir, resolveSkillsDir } from "./agent-context";
+import {
+	readInitContent,
+	resolveCharacterDir,
+	resolveSkillsDir,
+} from "./agent-context";
 import { resolveModelConfig, runLlmLoop } from "./llm-loop";
 import {
 	bootstrapRuntime,
@@ -9,7 +13,11 @@ import {
 	type TimerScheduler,
 } from "./runtime";
 import { resolveHistoryDir, SessionStore } from "./session-store";
-import { createWorkspaceTools, resolveWorkspaceDir } from "./workspace";
+import {
+	createSandboxedFileReader,
+	createWorkspaceTools,
+	resolveWorkspaceDir,
+} from "./workspace";
 
 function createShutdownSignal(): {
 	dispose: () => void;
@@ -71,11 +79,18 @@ async function main(): Promise<void> {
 		mkdirSync(skillsDir, { recursive: true });
 		const sessionStore = new SessionStore(historyDir);
 		await sessionStore.ensureDefaultSessionIfEmpty();
+		const readAgentFile = createSandboxedFileReader(
+			workspaceDir,
+			historyDir,
+			process.platform,
+			characterDir,
+			skillsDir,
+		);
 		const result = await bootstrapRuntime({
 			abortSignal: abortController.signal,
 			startedDaemons: daemonsRef.current,
 			sessionStore,
-			characterDir,
+			readInit: () => readInitContent(characterDir, readAgentFile),
 		});
 		eventQueue = result.eventQueue;
 		timerSchedulerRef.current = result.timerScheduler;
@@ -101,6 +116,7 @@ async function main(): Promise<void> {
 				workspaceDir,
 				historyDir,
 				characterDir,
+				readAgentFile,
 				homeDir,
 				modulesRoot: result.modulesRoot,
 				skillsDir,
