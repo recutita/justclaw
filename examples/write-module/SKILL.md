@@ -411,7 +411,7 @@ No destination information is included. The module determines where to deliver t
 {
   "type": "tool_call.v1",
   "tool": "shell",
-  "input": { "commands": ["ls -la"] },
+  "input": { "command": "ls -la" },
   "output": "{\"output\":[{\"stdout\":\"...\",\"stderr\":\"\",\"outcome\":{\"type\":\"exit\",\"exitCode\":0}}]}"
 }
 ```

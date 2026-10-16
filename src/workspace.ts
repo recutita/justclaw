@@ -576,32 +576,42 @@ export function createWorkspaceTools(
 	const shellFunctionTool = tool({
 		name: "shell",
 		description:
-			"Execute shell commands sequentially in the workspace sandbox. Each command runs as `sh -c <command>`. Commands do not share state between calls.",
+			"Execute a shell command in the workspace sandbox. The command runs as `sh -c <command>`. State is not shared between calls.",
+		// A single string, not an array: Qwen3.8 on vLLM's XML tool-call format
+		// frequently malformed a `commands: string[]` parameter (sent {} or
+		// wrapped it in {"arguments": ...}). The other tools here, and other
+		// harnesses whose shell takes a string, did not hit this with that model.
 		parameters: {
 			type: "object",
 			properties: {
-				commands: {
-					type: "array",
-					items: { type: "string" },
-					description: "Shell commands to execute in order",
+				command: {
+					type: "string",
+					description: "Shell command to execute",
 				},
 				timeout_ms: {
 					type: "number",
-					description: "Per-command timeout in milliseconds (default: 30000)",
+					description: "Timeout in milliseconds (default: 30000)",
 				},
 			},
-			required: ["commands"],
+			required: ["command"],
 			additionalProperties: false,
 			// biome-ignore lint/suspicious/noExplicitAny: avoid @openai/agents-core subpath types for parameters
 		} as any,
 		strict: false as false,
 		execute: async (input: unknown) => {
-			const { commands, timeout_ms } = input as {
-				commands: string[];
+			const { command, timeout_ms } = input as {
+				command: unknown;
 				timeout_ms?: number;
 			};
+			// Not strict, so the provider does not enforce the schema, and a model
+			// has sent {} or {"arguments": "<json>"}. Return the expected shape as a
+			// tool result: a thrown TypeError reads like a tool bug, and the model
+			// repeated the same malformed call.
+			if (typeof command !== "string") {
+				return 'shell: "command" must be a string, e.g. {"command": "ls -la"}';
+			}
 			const action: ShellAction = {
-				commands,
+				commands: [command],
 				...(timeout_ms !== undefined ? { timeoutMs: timeout_ms } : {}),
 			};
 			const result = await shell.run(action);
