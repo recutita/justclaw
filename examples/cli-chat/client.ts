@@ -22,6 +22,22 @@ function prompt(): void {
 	}
 }
 
+/**
+ * Everything the daemon relays (LLM replies, shell commands and their output,
+ * history) can carry bytes from files or pages the agent read. Written raw, a
+ * terminal would run their escape sequences: rewrite what was displayed, set
+ * the clipboard (OSC 52), or answer a query into stdin, which this client sends
+ * to the agent as user input. Every control character except newline and tab
+ * is shown as `\xNN` instead.
+ */
+function escapeControlChars(text: string): string {
+	return text.replace(
+		// biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters is the point
+		/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g,
+		(c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, "0")}`,
+	);
+}
+
 const stdinUtf8Decoder = new TextDecoder();
 /** Replaced in connect open() for a fresh decoder per connection. */
 let serverToClientUtf8Decoder = new TextDecoder();
@@ -87,7 +103,9 @@ try {
 				void stdinLoop(socket);
 			},
 			data(_socket, data) {
-				const text = serverToClientUtf8Decoder.decode(data, { stream: true });
+				const text = escapeControlChars(
+					serverToClientUtf8Decoder.decode(data, { stream: true }),
+				);
 				if (text.length > 0) {
 					process.stdout.write(text);
 					if (waitingLocalCommandResponse) {
@@ -99,13 +117,17 @@ try {
 			},
 			close() {
 				clearDelayedPromptTimer();
-				process.stdout.write(serverToClientUtf8Decoder.decode());
+				process.stdout.write(
+					escapeControlChars(serverToClientUtf8Decoder.decode()),
+				);
 				process.stderr.write("[disconnected]\n");
 				process.exit(1);
 			},
 			error() {
 				clearDelayedPromptTimer();
-				process.stdout.write(serverToClientUtf8Decoder.decode());
+				process.stdout.write(
+					escapeControlChars(serverToClientUtf8Decoder.decode()),
+				);
 				process.stderr.write("[disconnected]\n");
 				process.exit(1);
 			},

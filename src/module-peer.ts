@@ -11,6 +11,22 @@ import {
 } from "./event-queue";
 import type { SessionStore } from "./session-store";
 
+/**
+ * Writes one line of a module's stderr to the core's stderr. The module is
+ * code the LLM can write and may relay outside content, and the core's stderr
+ * is usually the operator's terminal, outside every sandbox. Raw ESC sequences
+ * there could rewrite earlier log lines or set the clipboard (OSC 52), so every
+ * control character except tab is shown as `\xNN` instead.
+ */
+export function logModuleStderr(moduleName: string, line: string): void {
+	const escaped = line.replace(
+		// biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters is the point
+		/[\x00-\x08\x0a-\x1f\x7f-\x9f]/g,
+		(c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, "0")}`,
+	);
+	console.error(`[${moduleName}] ${escaped}`);
+}
+
 export type EventParams = Record<string, unknown> & {
 	type: "event.v1" | "image.send.v1" | "file.send.v1" | "audio.send.v1";
 };
