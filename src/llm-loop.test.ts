@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -37,6 +37,7 @@ import {
 } from "./llm-loop";
 import { type StartedDaemon, stopDaemons } from "./runtime";
 import { buildRuntimeInstructions } from "./runtime-prompt";
+import { removeSandboxTmpDir } from "./sandbox";
 import { SessionStore } from "./session-store";
 
 // Tests read character files from the host; production reads them inside the
@@ -63,6 +64,11 @@ const originalInputModalities = process.env.JUSTCLAW_OPENAI_INPUT_MODALITIES;
 const originalModelTimeout = process.env.JUSTCLAW_MODEL_TIMEOUT;
 const originalToolTimeout = process.env.JUSTCLAW_TOOL_TIMEOUT;
 const originalExtraBody = process.env.JUSTCLAW_OPENAI_EXTRA_BODY;
+
+// Sandboxes spawned or built here create the process-wide temp dir on first use.
+afterAll(() => {
+	removeSandboxTmpDir();
+});
 
 afterEach(async () => {
 	if (originalExtraBody === undefined) {

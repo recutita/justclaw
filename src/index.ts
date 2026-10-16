@@ -12,6 +12,7 @@ import {
 	stopDaemons,
 	type TimerScheduler,
 } from "./runtime";
+import { removeSandboxTmpDir } from "./sandbox";
 import { resolveHistoryDir, SessionStore } from "./session-store";
 import {
 	createSandboxedFileReader,
@@ -133,6 +134,7 @@ async function main(): Promise<void> {
 		throw error;
 	} finally {
 		shutdown.dispose();
+		removeSandboxTmpDir();
 	}
 }
 

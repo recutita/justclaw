@@ -1,5 +1,6 @@
-import { constants } from "node:fs";
+import { constants, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { access, realpath } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import type {
 	DaemonModuleManifest,
@@ -24,12 +25,16 @@ type SandboxOptions = {
 	) => Promise<string | null>;
 	pathExists?: (path: string) => Promise<boolean>;
 	realPath?: (path: string) => Promise<string>;
+	/** Host directory exposed as the sandbox's temp area; defaults to {@link getSandboxTmpDir}. */
+	tmpDir?: string;
 };
 
 type LinuxBubblewrapOptions = {
 	env?: NodeJS.ProcessEnv;
 	pathExists?: (path: string) => Promise<boolean>;
 	realPath?: (path: string) => Promise<string>;
+	/** Host directory bound at /tmp; defaults to {@link getSandboxTmpDir}. */
+	tmpDir?: string;
 };
 
 export type LinuxWorkspaceBwrapOptions = {
@@ -44,6 +49,8 @@ export type LinuxWorkspaceBwrapOptions = {
 	modulesRoot?: string;
 	/** Skills directory; rw-mounted when present on the host (same visibility as characterDir). */
 	skillsDir?: string;
+	/** Host directory bound at /tmp; defaults to {@link getSandboxTmpDir}. */
+	tmpDir?: string;
 };
 
 export type WorkspaceSandboxBaseOptions = {
@@ -61,9 +68,39 @@ export type WorkspaceSandboxBaseOptions = {
 	modulesRoot?: string;
 	/** Skills directory; rw-mounted in the workspace sandbox when set. */
 	skillsDir?: string;
+	/** Host directory exposed as the sandbox's temp area; defaults to {@link getSandboxTmpDir}. */
+	tmpDir?: string;
 };
 
-const DARWIN_TMP_PATHS = ["/tmp", "/private/tmp"] as const;
+/**
+ * Every sandbox gets this directory as its temp area instead of the host's
+ * /tmp. The host /tmp holds other processes' credential sockets and files
+ * (ssh-agent, Kerberos ccache, tmux), and code in the sandbox is code the LLM
+ * controls. One directory per core process, shared by all sandboxes, because
+ * the shell tool starts a fresh sandbox per command and a file written to /tmp
+ * in one call is expected in the next. mkdtemp creates it 0700 under an
+ * unpredictable name, so another local user cannot pre-create or symlink it.
+ * Created on first use so importing this module has no side effect.
+ */
+let sandboxTmpDir: string | undefined;
+
+export function getSandboxTmpDir(): string {
+	// Resolved because sandbox-exec matches resolved paths, and os.tmpdir() on
+	// darwin sits under the /var -> /private/var symlink.
+	sandboxTmpDir ??= realpathSync(
+		mkdtempSync(path.join(os.tmpdir(), "justclaw-")),
+	);
+	return sandboxTmpDir;
+}
+
+export function removeSandboxTmpDir(): void {
+	if (sandboxTmpDir === undefined) {
+		return;
+	}
+	rmSync(sandboxTmpDir, { recursive: true, force: true });
+	sandboxTmpDir = undefined;
+}
+
 const DARWIN_READONLY_PATHS = [
 	"/System",
 	"/usr",
@@ -187,19 +224,6 @@ function normalizeDarwinTempPath(tempPath: string): string[] {
 	return [normalized];
 }
 
-function getDarwinTempPaths(env: NodeJS.ProcessEnv): string[] {
-	const tempPaths = new Set<string>(DARWIN_TMP_PATHS);
-	if (!env.TMPDIR) {
-		return [...tempPaths];
-	}
-
-	for (const tempPath of normalizeDarwinTempPath(env.TMPDIR)) {
-		tempPaths.add(tempPath);
-	}
-
-	return [...tempPaths];
-}
-
 export function createDarwinSandboxProfile(
 	moduleDir: string,
 	env: NodeJS.ProcessEnv = process.env,
@@ -207,6 +231,7 @@ export function createDarwinSandboxProfile(
 	extraReadonlyPaths: string[] = [],
 	/** Operator-configured read-write paths (JUSTCLAW_SANDBOX_RW_PATHS). */
 	extraReadWritePaths: string[] = [],
+	tmpDir: string = getSandboxTmpDir(),
 ): string {
 	// sandbox-exec's (subpath moduleDir) does not grant read access to parent
 	// directories themselves, but Bun reads ancestor directories on startup.
@@ -223,14 +248,14 @@ export function createDarwinSandboxProfile(
 	const allowedReadonlySubpaths = [
 		moduleDir,
 		...DARWIN_READONLY_PATHS,
-		...getDarwinTempPaths(env),
+		...normalizeDarwinTempPath(tmpDir),
 		...nixProfileBinPaths,
 		...extraReadonlyPaths,
 		...extraReadWritePaths,
 	]
 		.map((readonlyPath) => `  (subpath ${quoteSandboxString(readonlyPath)})`)
 		.join("\n");
-	const allowedTempSubpaths = getDarwinTempPaths(env)
+	const allowedTempSubpaths = normalizeDarwinTempPath(tmpDir)
 		.map((tempPath) => `  (subpath ${quoteSandboxString(tempPath)})`)
 		.join("\n");
 	const allowedReadWriteSubpaths = extraReadWritePaths
@@ -285,6 +310,7 @@ export function createDarwinWorkspaceSandboxProfile(
 	extraReadonlyPaths: string[] = [],
 	/** Operator-configured read-write paths (JUSTCLAW_SANDBOX_RW_PATHS). */
 	extraReadWritePaths: string[] = [],
+	tmpDir: string = getSandboxTmpDir(),
 ): string {
 	const workspaceAncestors = collectDarwinAncestorLiterals(workspaceDir);
 	const historyAncestors = includeHistoryDir
@@ -314,14 +340,14 @@ export function createDarwinWorkspaceSandboxProfile(
 		...(modulesRoot ? [modulesRoot] : []),
 		...(skillsDir ? [skillsDir] : []),
 		...DARWIN_READONLY_PATHS,
-		...getDarwinTempPaths(env),
+		...normalizeDarwinTempPath(tmpDir),
 		...nixProfileBinPaths,
 		...extraReadonlyPaths,
 		...extraReadWritePaths,
 	]
 		.map((p) => `  (subpath ${quoteSandboxString(p)})`)
 		.join("\n");
-	const allowedTempSubpaths = getDarwinTempPaths(env)
+	const allowedTempSubpaths = normalizeDarwinTempPath(tmpDir)
 		.map((tempPath) => `  (subpath ${quoteSandboxString(tempPath)})`)
 		.join("\n");
 	const allowedReadWriteSubpaths = extraReadWritePaths
@@ -524,6 +550,17 @@ function appendWritableMount(cmd: string[], mountPath: string): void {
 	cmd.push("--bind", mountPath, mountPath);
 }
 
+/**
+ * Emitted before every other mount: bwrap applies binds in order, so a later
+ * mount whose destination lies under /tmp (e.g. a workspace or operator path
+ * that lives in the host /tmp) lands on top of it instead of being shadowed.
+ * Not recorded in rwRoots: host paths under /tmp are not visible through it,
+ * so they still need their own mount.
+ */
+function appendPrivateTmpMount(cmd: string[], tmpDir: string): void {
+	cmd.push("--bind", tmpDir, "/tmp");
+}
+
 function appendDestinationAncestors(
 	cmd: string[],
 	destinationPath: string,
@@ -552,6 +589,7 @@ export async function createLinuxBubblewrapCommand(
 		"--new-session",
 		"--unshare-pid",
 	];
+	appendPrivateTmpMount(cmd, options.tmpDir ?? getSandboxTmpDir());
 	// Tracked separately (rather than one combined set) so an operator RW path
 	// nested under a standard RO root (e.g. /etc/myagent under /etc) is not
 	// mistaken for "already covered" and silently downgraded to read-only.
@@ -584,15 +622,13 @@ export async function createLinuxBubblewrapCommand(
 		} catch {}
 	}
 
-	for (const writablePath of [...new Set(["/tmp", manifest.moduleDir])]) {
-		if (!(await pathExists(writablePath))) {
-			throw new Error(
-				`Required writable sandbox path is unavailable: ${writablePath}`,
-			);
-		}
-		appendWritableMount(cmd, writablePath);
-		rwRoots.add(writablePath);
+	if (!(await pathExists(manifest.moduleDir))) {
+		throw new Error(
+			`Required writable sandbox path is unavailable: ${manifest.moduleDir}`,
+		);
 	}
+	appendWritableMount(cmd, manifest.moduleDir);
+	rwRoots.add(manifest.moduleDir);
 
 	// Covers the common case of a module written in the same runtime as the
 	// core (e.g. `#!/usr/bin/env bun` resolving to ~/.bun/bin/bun) without
@@ -661,6 +697,7 @@ export async function createLinuxWorkspaceBwrapCommand(
 		"--new-session",
 		"--unshare-pid",
 	];
+	appendPrivateTmpMount(cmd, options.tmpDir ?? getSandboxTmpDir());
 	// Tracked separately (rather than one combined set) so an operator RW path
 	// nested under a standard RO root (e.g. /etc/myagent under /etc) is not
 	// mistaken for "already covered" and silently downgraded to read-only.
@@ -738,15 +775,6 @@ export async function createLinuxWorkspaceBwrapCommand(
 		}
 	}
 
-	const tmpPath = "/tmp";
-	if (!(await pathExists(tmpPath))) {
-		throw new Error(
-			`Required writable sandbox path is unavailable: ${tmpPath}`,
-		);
-	}
-	appendWritableMount(cmd, tmpPath);
-	rwRoots.add(tmpPath);
-
 	const operatorMounts = await resolveOperatorSandboxMounts(env, pathExists);
 	for (const readonlyPath of operatorMounts.readonlyPaths) {
 		if (!isPathCoveredByAny(readonlyPath, roRoots, rwRoots)) {
@@ -793,11 +821,14 @@ export async function createWorkspaceSandboxBaseCommand(
 	const characterDir = options.characterDir;
 	const modulesRoot = options.modulesRoot;
 	const skillsDir = options.skillsDir;
+	const tmpDir = options.tmpDir ?? getSandboxTmpDir();
 
 	const historyExists = await pathExists(historyDir);
 
 	if (platform === "darwin") {
-		const env = filterSandboxEnv(envBase);
+		// sandbox-exec cannot remap paths, so the private temp dir is reached
+		// through TMPDIR at its host path; /tmp itself is not allowed.
+		const env = { ...filterSandboxEnv(envBase), TMPDIR: tmpDir };
 		const sandboxExecPath = await lookupExecutable("sandbox-exec", env);
 		if (!sandboxExecPath) {
 			throw new Error("sandbox-exec backend is unavailable");
@@ -819,6 +850,7 @@ export async function createWorkspaceSandboxBaseCommand(
 			skillsDir,
 			operatorMounts.readonlyPaths,
 			operatorMounts.readWritePaths,
+			tmpDir,
 		);
 		return {
 			backend: "sandbox-exec",
@@ -828,8 +860,8 @@ export async function createWorkspaceSandboxBaseCommand(
 	}
 
 	if (platform === "linux") {
-		// The host TMPDIR may point at a path that does not exist inside the
-		// bwrap root; /tmp is always mounted writable, so pin TMPDIR to it.
+		// The host TMPDIR names a host path the bwrap root does not have; the
+		// private temp dir is bound at /tmp, so pin TMPDIR to it.
 		const env = { ...filterSandboxEnv(envBase), TMPDIR: "/tmp" };
 		const bwrapPath = await lookupExecutable("bwrap", env);
 		if (!bwrapPath) {
@@ -851,6 +883,7 @@ export async function createWorkspaceSandboxBaseCommand(
 				characterDir,
 				modulesRoot,
 				skillsDir,
+				tmpDir,
 			},
 		);
 		return {
@@ -878,14 +911,13 @@ export async function createSandboxLaunchSpec(
 ): Promise<SandboxLaunchSpec> {
 	const platform = options.platform ?? process.platform;
 	const envBase = options.env ?? process.env;
-	// On Linux the host TMPDIR may point at a path that does not exist inside
-	// the bwrap root; /tmp is always mounted writable, so pin TMPDIR to it.
-	// On darwin the host paths remain visible, so the sandbox profile allows
-	// the host TMPDIR instead (see getDarwinTempPaths).
-	const env =
-		platform === "linux"
-			? { ...filterSandboxEnv(envBase), TMPDIR: "/tmp" }
-			: { ...filterSandboxEnv(envBase) };
+	const tmpDir = options.tmpDir ?? getSandboxTmpDir();
+	// On Linux the private temp dir is bound at /tmp. sandbox-exec cannot remap
+	// paths, so on darwin TMPDIR names the private temp dir at its host path.
+	const env = {
+		...filterSandboxEnv(envBase),
+		TMPDIR: platform === "linux" ? "/tmp" : tmpDir,
+	};
 	const lookupExecutable = options.lookupExecutable ?? defaultLookupExecutable;
 	const pathExists = options.pathExists ?? defaultPathExists;
 	const backend = resolveSandboxBackend(platform);
@@ -904,7 +936,7 @@ export async function createSandboxLaunchSpec(
 		const standardCovered = [
 			manifest.moduleDir,
 			...DARWIN_READONLY_PATHS,
-			...getDarwinTempPaths(env),
+			...normalizeDarwinTempPath(tmpDir),
 		];
 		const extraReadonlyPaths = (await pathExists(coreRuntimeDir))
 			? [coreRuntimeDir].filter((p) => !isPathCovered(p, standardCovered))
@@ -941,6 +973,7 @@ export async function createSandboxLaunchSpec(
 					env,
 					extraReadonlyPaths,
 					extraReadWritePaths,
+					tmpDir,
 				),
 				"--",
 				manifest.execPath,
@@ -963,6 +996,7 @@ export async function createSandboxLaunchSpec(
 			env: envBase,
 			pathExists,
 			realPath: options.realPath ?? defaultRealPath,
+			tmpDir,
 		}),
 		cwd: manifest.moduleDir,
 		env,

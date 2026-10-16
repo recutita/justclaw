@@ -1,9 +1,15 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { removeSandboxTmpDir } from "./sandbox";
 
 const hasBwrap = Boolean(Bun.which("bwrap"));
+
+// Sandboxes spawned or built here create the process-wide temp dir on first use.
+afterAll(() => {
+	removeSandboxTmpDir();
+});
 
 describe("WorkspaceShell", () => {
 	test.skipIf(!hasBwrap)("runs sh -c commands and returns output", async () => {

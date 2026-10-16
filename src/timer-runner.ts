@@ -3,6 +3,7 @@ import { consumeLines, type JsonRpcNotification, JsonRpcPeer } from "./jsonrpc";
 import type { TimerModuleManifest } from "./module-manifest";
 import {
 	createSessionRequestHandler,
+	logModuleStderr,
 	parseEventNotificationParams,
 } from "./module-peer";
 import { createSandboxLaunchSpec, type SandboxLaunchSpec } from "./sandbox";
@@ -179,7 +180,7 @@ async function runTimerLifecycle(
 	// the same task for ordering.
 	stdoutTask.catch(() => {});
 	void consumeLines(proc.stderr, (line) => {
-		console.error(`[${manifest.name}] ${line}`);
+		logModuleStderr(manifest.name, line);
 	});
 
 	let timeoutHandle: ReturnType<typeof setTimeout> | undefined;

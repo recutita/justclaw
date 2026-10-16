@@ -1,8 +1,11 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { createWorkspaceSandboxBaseCommand } from "./sandbox";
+import {
+	createWorkspaceSandboxBaseCommand,
+	removeSandboxTmpDir,
+} from "./sandbox";
 import {
 	createSandboxedFileReader,
 	resolveWorkspaceDir,
@@ -19,6 +22,11 @@ const hasSandbox =
 	(process.platform === "darwin" && Boolean(Bun.which("sandbox-exec")));
 
 const tempDirs: string[] = [];
+
+// Sandboxes spawned or built here create the process-wide temp dir on first use.
+afterAll(() => {
+	removeSandboxTmpDir();
+});
 
 afterEach(async () => {
 	while (tempDirs.length > 0) {

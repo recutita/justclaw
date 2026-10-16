@@ -544,6 +544,15 @@ The core does not parse module entrypoint shebangs. An interpreter named in a sh
 
 **Rationale:** An earlier design parsed each module's shebang and exposed the resolved interpreter's parent directory. Because the shebang line is module-controlled input (and the LLM can write it via the rw-mounted modules root), that let a module expose the parent directory of any path it named, including host directories with no relation to the module's own runtime.
 
+The module directory is mounted read-write, and so is a private temp directory. The core creates that directory with `mkdtemp` under the host temp directory the first time it builds a sandbox, and removes it on shutdown. It is shared by every module sandbox and the workspace sandbox. The host `/tmp` itself is not exposed:
+
+| Platform | Private temp directory | `TMPDIR` |
+|---|---|---|
+| Linux | Bound at `/tmp` | `/tmp` |
+| macOS | Allowed at its host path, e.g. `/private/var/folders/.../T/justclaw-XXXXXX`; `/tmp` and `/private/tmp` are not allowed | The host path |
+
+**Rationale:** The host `/tmp` holds other processes' credential sockets and files: ssh-agent sockets, Kerberos ticket caches, tmux server sockets. Code in either sandbox is code the LLM controls (see [Sandbox environment](#sandbox-environment)), so exposing the host `/tmp` hands it those credentials. The directory is per core process rather than per sandbox because the shell tool starts a fresh sandbox for each command, and a file written to `/tmp` in one call is expected in the next. `mkdtemp` creates it mode 0700 under an unpredictable name, so another local user cannot create or symlink it in advance.
+
 ### Operator-configured sandbox paths
 
 Two environment variables let the operator add mount paths beyond the standard allowlist. Both are colon-separated lists of absolute paths, validated against the host filesystem: relative paths, paths containing `..`, and paths that resolve differently once normalized (e.g. `//`, `/.`) are rejected; entries that don't exist on the host are skipped. Rejected or missing entries are logged and otherwise ignored (fail closed).
@@ -568,7 +577,7 @@ Neither sandbox inherits the parent environment. Module processes and the worksp
 
 These name locations, not capabilities: whether a directory is reachable is decided by the mounts. A module sees `JUSTCLAW_CHARACTER` but cannot read that directory, because the module sandbox does not mount it.
 
-Unlike `JUSTCLAW_SANDBOX_RO_PATHS`/`_RW_PATHS`, this setting names variables rather than host paths, so there is nothing to validate against the filesystem; a name that is unset in the parent environment is silently dropped. After filtering, `PATH` is extended with the core's runtime directory (see above) and, on Linux, `TMPDIR` is pinned to `/tmp`.
+Unlike `JUSTCLAW_SANDBOX_RO_PATHS`/`_RW_PATHS`, this setting names variables rather than host paths, so there is nothing to validate against the filesystem; a name that is unset in the parent environment is silently dropped. After filtering, `PATH` is extended with the core's runtime directory (see above) and `TMPDIR` is set to the private temp directory (see above).
 
 **Modules are not a trust boundary against the LLM.** The modules root is mounted read-write in the workspace sandbox, so the LLM writes and rewrites module entrypoints; whatever a module process can read, the LLM can read by editing that module's code. Naming a variable in `JUSTCLAW_SANDBOX_ENV` hands it to the agent, whichever sandbox the operator had in mind. That is also why the grant is not per-module: a per-module split would defend modules from each other, and modules are not adversaries of each other — they are parts of one agent.
 
@@ -637,7 +646,7 @@ The core reads these files, `INIT.md`, and each `SKILL.md` inside the workspace 
 
 ### Workspace sandbox
 
-Built-in `shell`, `create_file`, `edit_file`, and `delete_file` run inside the workspace sandbox. That sandbox grants read-write access to the workspace directory, read-write access to the character directory, read-write access to the runtime modules directory (the same path the core uses to discover and load modules; same mount semantics as the character directory), read-write access to the skills directory (when configured; same mount semantics as the character directory), and read-only access to the history directory (when it exists on the host), in addition to the standard OS read-only paths and temp rules described for module execution. Path boundaries are enforced by the sandbox; the application does not duplicate that check. The environment is filtered to the same allowlist as module processes (see [Sandbox environment](#sandbox-environment)).
+Built-in `shell`, `create_file`, `edit_file`, and `delete_file` run inside the workspace sandbox. That sandbox grants read-write access to the workspace directory, read-write access to the character directory, read-write access to the runtime modules directory (the same path the core uses to discover and load modules; same mount semantics as the character directory), read-write access to the skills directory (when configured; same mount semantics as the character directory), and read-only access to the history directory (when it exists on the host), in addition to the standard OS read-only paths and the private temp directory described for module execution. Path boundaries are enforced by the sandbox; the application does not duplicate that check. The environment is filtered to the same allowlist as module processes (see [Sandbox environment](#sandbox-environment)).
 
 ## Skills directory
 
