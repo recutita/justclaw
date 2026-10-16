@@ -15,6 +15,20 @@ export const CHARACTER_FILES = [
 	"MEMORY.md",
 ] as const;
 
+/**
+ * Reads a file the agent can write (character files, INIT.md, SKILL.md) and
+ * returns its text, or null when it is absent or unreadable.
+ *
+ * The core runs unsandboxed, but the agent can replace any of these files with
+ * a symlink to a host path it cannot reach itself (e.g. `~/.ssh/id_ed25519`).
+ * A host-side read would follow the link and put the target into the prompt.
+ * The bundled entrypoint therefore reads them inside the workspace sandbox
+ * (see createSandboxedFileReader), where a path resolves only to what the
+ * agent could read anyway. Injected rather than imported so these loaders stay
+ * free of sandbox plumbing and tests can read from the host directly.
+ */
+export type ReadAgentFile = (absPath: string) => Promise<string | null>;
+
 export function resolveSkillsDir(
 	justclawHome = process.env.JUSTCLAW_HOME,
 	override = process.env.JUSTCLAW_SKILLS,
@@ -60,13 +74,10 @@ export function resolveCharacterDir(
  */
 export async function readInitContent(
 	characterDir: string,
+	readFile: ReadAgentFile,
 ): Promise<string | null> {
-	const file = Bun.file(path.join(characterDir, "INIT.md"));
-	if (!(await file.exists())) {
-		return null;
-	}
-	const trimmed = (await file.text()).trim();
-	return trimmed || null;
+	const content = await readFile(path.join(characterDir, "INIT.md"));
+	return content?.trim() || null;
 }
 
 /**
@@ -90,23 +101,17 @@ export async function loadHomeAgentsFile(homeDir: string): Promise<string> {
  * content is not escaped, so it is forgeable by content that emits closing
  * tags (see "Fence trust model" in docs/spec.md for why that is acceptable).
  * Sections are joined with a blank line.
- * Missing files are silently skipped; other read errors propagate.
- * Reads text() directly rather than checking exists() first: a file removed
- * between the check and the read would otherwise throw ENOENT and crash the
- * whole core (uncaught per-event), instead of just being treated as absent.
+ * Missing or unreadable files are skipped.
  */
-export async function loadAgentContext(characterDir: string): Promise<string> {
+export async function loadAgentContext(
+	characterDir: string,
+	readFile: ReadAgentFile,
+): Promise<string> {
 	const sections: string[] = [];
 	for (const filename of CHARACTER_FILES) {
-		const file = Bun.file(path.join(characterDir, filename));
-		let content: string;
-		try {
-			content = await file.text();
-		} catch (err) {
-			if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-				continue;
-			}
-			throw err;
+		const content = await readFile(path.join(characterDir, filename));
+		if (content === null) {
+			continue;
 		}
 		const trimmed = content.trim();
 		if (trimmed) {
@@ -156,15 +161,16 @@ function parseFrontmatter(
  */
 export async function loadSkillsIndex(
 	skillsDir: string,
+	readFile: ReadAgentFile,
 ): Promise<Array<{ name: string; description: string }>> {
 	const skills: Array<{ name: string; description: string }> = [];
 	const glob = new Bun.Glob("*/SKILL.md");
 	for await (const relPath of glob.scan({ cwd: skillsDir, onlyFiles: true })) {
+		// Listing on the host only reveals whether a symlinked directory holds a
+		// SKILL.md; the contents are read through readFile.
 		const skillMdPath = path.join(skillsDir, relPath);
-		let content: string;
-		try {
-			content = await Bun.file(skillMdPath).text();
-		} catch {
+		const content = await readFile(skillMdPath);
+		if (content === null) {
 			continue;
 		}
 		const fm = parseFrontmatter(content);

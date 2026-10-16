@@ -628,9 +628,21 @@ The core reads the following files from the character directory, in order:
 
 The tag name is the filename itself (e.g. `<SOUL.md>`); runtime instructions document what each file means, so no descriptive attribute is needed. The fence delimits blocks whose content does not itself emit closing tags; it is not proof against forgery (see [Fence trust model](#fence-trust-model)). File content stays Markdown; only the boundary is XML. Sections are joined with a blank line. The combined string becomes **context instructions** in the agent system prompt (see [Agent system prompt](#agent-system-prompt)).
 
-Missing files are silently skipped. An empty directory (or one containing none of the above filenames) produces empty context instructions. Other I/O errors from reading a present file propagate and abort `runLlmLoop` (they are not caught per-event).
+Missing or unreadable files are silently skipped. An empty directory (or one containing none of the above filenames) produces empty context instructions.
 
 The bundled LLM loop re-reads these files from disk immediately before each `event.v1` is passed to the model. Because the character directory is rw-mounted in the workspace sandbox, the LLM can edit these files via workspace tools; edits take effect on the next turn.
+
+The core reads these files, `INIT.md`, and each `SKILL.md` inside the workspace sandbox, not on the host. Each read runs `head` in a fresh sandbox, which mounts the workspace, character, and skills directories but not the modules root:
+
+| Case | Result |
+|---|---|
+| Regular file | Its content |
+| Missing, a directory, or the read fails | Treated as absent |
+| Symlink to a path the sandbox does not mount (e.g. `~/.ssh/id_ed25519`) | Treated as absent |
+| Larger than 1 MiB (including a symlink to `/dev/zero`) | First 1 MiB, with a line on stderr |
+| Blocks (e.g. a FIFO with no writer) | Treated as absent after the 30-second file tool timeout |
+
+**Rationale:** The core process is unsandboxed, and the LLM writes these files. A host-side read follows a symlink the LLM planted to any file the core's user can read, and puts its content into the system prompt. Reading inside the sandbox resolves the path with the same mounts the LLM's own shell has, so a read can only return what the LLM could already read.
 
 ### Workspace sandbox
 
@@ -683,7 +695,7 @@ Both fields must be YAML strings. Values that YAML types as something else are t
 
 ### Skill discovery
 
-Before each LLM turn, the bundled loop scans `skills/*/SKILL.md`, parses frontmatter, and injects a skill index (name + description table) into the runtime instructions. Full skill content is not loaded automatically; the LLM reads it on demand via `shell`.
+Before each LLM turn, the bundled loop scans `skills/*/SKILL.md`, reads each one inside the workspace sandbox (see [Character files](#character-files)), parses frontmatter, and injects a skill index (name + description table) into the runtime instructions. Full skill content is not loaded automatically; the LLM reads it on demand via `shell`.
 
 Because the skills directory is rw-mounted in the workspace sandbox, the LLM can create, edit, and delete skills using `shell`, `create_file`, `edit_file`, and `delete_file`.
 

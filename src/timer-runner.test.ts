@@ -3,6 +3,7 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { type ReadAgentFile, readInitContent } from "./agent-context";
 import { EventQueue } from "./event-queue";
 import {
 	resolveModulesRoot,
@@ -15,6 +16,16 @@ import {
 	registerInProcessCron,
 	startTimerSchedulers,
 } from "./timer-runner";
+
+// Tests read character files from the host; production reads them inside the
+// workspace sandbox (see createSandboxedFileReader).
+const readHostFile: ReadAgentFile = async (p) => {
+	try {
+		return await Bun.file(p).text();
+	} catch {
+		return null;
+	}
+};
 
 const tempDirs: string[] = [];
 
@@ -336,7 +347,7 @@ describe("fireTimer (F19: characterDir INIT injection)", () => {
 			await fireTimer(manifest, state, queue, ctx.sessionStore, {
 				sandboxFactory: async (m) =>
 					createUnsandboxedSpec(m.moduleDir, m.execPath),
-				characterDir,
+				readInit: () => readInitContent(characterDir, readHostFile),
 			});
 
 			// The switch enqueues a sessions.switch.v1 row followed by the INIT

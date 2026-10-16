@@ -21,6 +21,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { Agent, AgentInputItem, Runner } from "@openai/agents";
 import type { FunctionTool } from "@openai/agents-core";
 import { RunContext } from "@openai/agents-core";
+import { type ReadAgentFile, readInitContent } from "./agent-context";
 import { EventQueue } from "./event-queue";
 import { JsonRpcPeer } from "./jsonrpc";
 import { runLlmLoop } from "./llm-loop";
@@ -50,6 +51,16 @@ import {
 } from "./sandbox";
 import { SessionStore } from "./session-store";
 import { fireTimer } from "./timer-runner";
+
+// Tests read character files from the host; production reads them inside the
+// workspace sandbox (see createSandboxedFileReader).
+const readHostFile: ReadAgentFile = async (p) => {
+	try {
+		return await Bun.file(p).text();
+	} catch {
+		return null;
+	}
+};
 
 const tempDirs: string[] = [];
 const originalJustclawHome = process.env.JUSTCLAW_HOME;
@@ -3561,7 +3572,7 @@ describe("INIT.md startup hook", () => {
 			homeDir,
 			eventQueuePath: path.join(homeDir, "events.db"),
 			sessionStore,
-			characterDir,
+			readInit: () => readInitContent(characterDir, readHostFile),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -3581,7 +3592,12 @@ describe("INIT.md startup hook", () => {
 			runtime.eventQueue,
 			{ current: runtime.daemons },
 			"test-model",
-			{ runner: mockRunner, sessionStore, characterDir },
+			{
+				runner: mockRunner,
+				sessionStore,
+				characterDir,
+				readAgentFile: readHostFile,
+			},
 		);
 
 		await waitUntil(() => processedTexts.length >= 2);
@@ -3628,7 +3644,7 @@ describe("INIT.md startup hook", () => {
 			homeDir,
 			eventQueuePath: path.join(homeDir, "events.db"),
 			sessionStore,
-			characterDir,
+			readInit: () => readInitContent(characterDir, readHostFile),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -3648,7 +3664,12 @@ describe("INIT.md startup hook", () => {
 			runtime.eventQueue,
 			{ current: runtime.daemons },
 			"test-model",
-			{ runner: mockRunner, sessionStore, characterDir },
+			{
+				runner: mockRunner,
+				sessionStore,
+				characterDir,
+				readAgentFile: readHostFile,
+			},
 		);
 
 		await waitUntil(() => processedTexts.length >= 1);
@@ -3693,7 +3714,7 @@ describe("INIT.md startup hook", () => {
 			homeDir,
 			eventQueuePath: path.join(homeDir, "events.db"),
 			sessionStore,
-			characterDir,
+			readInit: () => readInitContent(characterDir, readHostFile),
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
 		});
@@ -3713,7 +3734,12 @@ describe("INIT.md startup hook", () => {
 			runtime.eventQueue,
 			{ current: runtime.daemons },
 			"test-model",
-			{ runner: mockRunner, sessionStore, characterDir },
+			{
+				runner: mockRunner,
+				sessionStore,
+				characterDir,
+				readAgentFile: readHostFile,
+			},
 		);
 
 		await waitUntil(() => processedTexts.length >= 1);
@@ -3775,6 +3801,7 @@ describe("runLlmLoop restart_modules integration", () => {
 			workspaceDir: "/tmp/ws",
 			historyDir: path.join(homeDir, "history"),
 			characterDir,
+			readAgentFile: readHostFile,
 			modulesRoot: runtime.modulesRoot,
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
@@ -3825,6 +3852,7 @@ describe("runLlmLoop restart_modules integration", () => {
 			workspaceDir: "/tmp/ws",
 			historyDir: path.join(homeDir, "history"),
 			characterDir,
+			readAgentFile: readHostFile,
 			modulesRoot: runtime.modulesRoot,
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
@@ -3880,6 +3908,7 @@ describe("runLlmLoop restart_modules integration", () => {
 			workspaceDir: "/tmp/ws",
 			historyDir: path.join(homeDir, "history"),
 			characterDir,
+			readAgentFile: readHostFile,
 			modulesRoot: badRoot,
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
@@ -3964,6 +3993,7 @@ describe("runLlmLoop restart_modules integration", () => {
 			workspaceDir: "/tmp/ws",
 			historyDir: path.join(homeDir, "history"),
 			characterDir,
+			readAgentFile: readHostFile,
 			modulesRoot: runtime.modulesRoot,
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
@@ -4032,6 +4062,7 @@ describe("runLlmLoop restart_modules integration", () => {
 			workspaceDir: "/tmp/ws",
 			historyDir: path.join(homeDir, "history"),
 			characterDir,
+			readAgentFile: readHostFile,
 			modulesRoot: runtime.modulesRoot,
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
@@ -4104,6 +4135,7 @@ describe("runLlmLoop restart_modules integration", () => {
 			workspaceDir: "/tmp/ws",
 			historyDir: path.join(homeDir, "history"),
 			characterDir,
+			readAgentFile: readHostFile,
 			modulesRoot: runtime.modulesRoot,
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
@@ -4158,6 +4190,7 @@ describe("runLlmLoop restart_modules integration", () => {
 			workspaceDir: "/tmp/ws",
 			historyDir: path.join(homeDir, "history"),
 			characterDir,
+			readAgentFile: readHostFile,
 			modulesRoot: runtime.modulesRoot,
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
@@ -4217,6 +4250,7 @@ describe("route_message", () => {
 			workspaceDir: "/tmp/ws",
 			historyDir: path.join(homeDir, "history"),
 			characterDir,
+			readAgentFile: readHostFile,
 			modulesRoot: runtime.modulesRoot,
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
@@ -4277,6 +4311,7 @@ describe("route_message", () => {
 			workspaceDir: "/tmp/ws",
 			historyDir: path.join(homeDir, "history"),
 			characterDir,
+			readAgentFile: readHostFile,
 			modulesRoot: runtime.modulesRoot,
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
@@ -4347,6 +4382,7 @@ describe("route_message", () => {
 			workspaceDir: "/tmp/ws",
 			historyDir: path.join(homeDir, "history"),
 			characterDir,
+			readAgentFile: readHostFile,
 			modulesRoot: runtime.modulesRoot,
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
@@ -4410,6 +4446,7 @@ describe("turn_end", () => {
 			workspaceDir: "/tmp/ws",
 			historyDir: path.join(homeDir, "history"),
 			characterDir,
+			readAgentFile: readHostFile,
 			modulesRoot: runtime.modulesRoot,
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
@@ -4522,6 +4559,7 @@ for await (const chunk of Bun.stdin.stream()) {
 			workspaceDir: "/tmp/ws",
 			historyDir: path.join(homeDir, "history"),
 			characterDir,
+			readAgentFile: readHostFile,
 			modulesRoot: runtime.modulesRoot,
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),
@@ -4639,6 +4677,7 @@ describe("module tool without parameters", () => {
 			workspaceDir: "/tmp/ws",
 			historyDir: path.join(homeDir, "history"),
 			characterDir,
+			readAgentFile: readHostFile,
 			modulesRoot: runtime.modulesRoot,
 			sandboxFactory: async (manifest) =>
 				createUnsandboxedSpec(manifest.moduleDir, manifest.execPath),

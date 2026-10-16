@@ -1,4 +1,3 @@
-import { readInitContent } from "./agent-context";
 import {
 	type EventDropDaemon,
 	notifyDropped,
@@ -101,7 +100,7 @@ export function createSessionRequestHandler(
 	manifestName: string,
 	queue: EventQueue,
 	sessionStore: SessionStore,
-	characterDir?: string,
+	readInit?: () => Promise<string | null>,
 	daemonsRef?: { current: EventDropDaemon[] },
 ): (method: string, params: unknown) => Promise<unknown> {
 	return async (method, params) => {
@@ -132,8 +131,8 @@ export function createSessionRequestHandler(
 				queue.enqueue(manifestName, { type: "sessions.switch.v1", id });
 				// Enqueue INIT before returning "ok" so it is ahead of any event the caller
 				// sends after receiving the response. Only fires for empty (new) sessions.
-				if (history.length === 0 && characterDir) {
-					const initText = await readInitContent(characterDir);
+				if (history.length === 0 && readInit) {
+					const initText = await readInit();
 					if (initText) {
 						queue.enqueue(manifestName, { type: "event.v1", text: initText });
 					}

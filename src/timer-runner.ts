@@ -105,7 +105,7 @@ function createTimerModulePeer(
 	process: Bun.Subprocess<"pipe", "pipe", "pipe">,
 	queue: EventQueue,
 	sessionStore: SessionStore,
-	characterDir?: string,
+	readInit?: () => Promise<string | null>,
 ): JsonRpcPeer {
 	return new JsonRpcPeer({
 		name: manifest.name,
@@ -126,7 +126,7 @@ function createTimerModulePeer(
 				`[${manifest.name}] ignoring unsupported notification ${message.method}`,
 			);
 		},
-		// characterDir wires INIT.md injection on sessions.switch.v1 for empty
+		// readInit wires INIT.md injection on sessions.switch.v1 for empty
 		// sessions, the same as daemons. daemonsRef is not threaded here: a timer
 		// has no reachable daemon list, so interrupt-overwrite event.dropped.v1
 		// notifications stay unsent for timer-initiated sessions.
@@ -134,7 +134,7 @@ function createTimerModulePeer(
 			manifest.name,
 			queue,
 			sessionStore,
-			characterDir,
+			readInit,
 		),
 	});
 }
@@ -152,14 +152,14 @@ async function runTimerLifecycle(
 	sessionStore: SessionStore,
 	state: { process: Bun.Subprocess<"pipe", "pipe", "pipe"> | null },
 	initializeTimeoutMs: number,
-	characterDir?: string,
+	readInit?: () => Promise<string | null>,
 ): Promise<void> {
 	const peer = createTimerModulePeer(
 		manifest,
 		proc,
 		queue,
 		sessionStore,
-		characterDir,
+		readInit,
 	);
 	const stdoutTask = consumeLines(proc.stdout, (line) => {
 		// A single malformed line (invalid JSON, bad envelope) must never tear
@@ -235,7 +235,7 @@ export async function fireTimer(
 			manifest: TimerModuleManifest,
 		) => Promise<SandboxLaunchSpec>;
 		initializeTimeoutMs?: number;
-		characterDir?: string;
+		readInit?: () => Promise<string | null>;
 	},
 ): Promise<void> {
 	const lock = (state.lock ?? Promise.resolve(null)).then(async () => {
@@ -301,7 +301,7 @@ export async function fireTimer(
 		sessionStore,
 		state,
 		initTimeoutMs,
-		options.characterDir,
+		options.readInit,
 	);
 }
 
@@ -316,7 +316,7 @@ export function startTimerSchedulers(
 			manifest: TimerModuleManifest,
 		) => Promise<SandboxLaunchSpec>;
 		initializeTimeoutMs?: number;
-		characterDir?: string;
+		readInit?: () => Promise<string | null>;
 	} = {},
 ): TimerScheduler {
 	if (manifests.length === 0) {
