@@ -25,3 +25,22 @@ describe("WorkspaceShell", () => {
 		}
 	});
 });
+
+describe("shell tool", () => {
+	test("returns the expected shape for malformed arguments", async () => {
+		const { RunContext } = await import("@openai/agents");
+		const { createWorkspaceTools } = await import("./workspace");
+		const [shell] = createWorkspaceTools("/nonexistent", "/nonexistent");
+		if (shell?.type !== "function") throw new Error("expected function tool");
+		for (const args of [
+			"{}",
+			'{"arguments":"ls"}',
+			'{"commands":["echo hi"]}',
+		]) {
+			const output = await shell.invoke(new RunContext(), args);
+			expect(output).toBe(
+				'shell: "command" must be a string, e.g. {"command": "ls -la"}',
+			);
+		}
+	});
+});

@@ -754,7 +754,7 @@ The core notifies the current message target each time a tool completes — both
   "params": {
     "type": "tool_call.v1",
     "tool": "shell",
-    "input": { "commands": ["ls -la"] },
+    "input": { "command": "ls -la" },
     "output": "{\"output\":[{\"stdout\":\"...\",\"stderr\":\"\",\"outcome\":{\"type\":\"exit\",\"exitCode\":0}}]}"
   }
 }
@@ -767,7 +767,7 @@ The core notifies the current message target each time a tool completes — both
 | `input` | object | Arguments passed to the tool by the LLM |
 | `output` | string | JSON-encoded result returned by the tool |
 
-For `shell`, `output` is a JSON-encoded `ShellResult` containing per-command stdout, stderr, and outcome (exit code or timeout). For `create_file`, `edit_file`, and `delete_file`, `output` is a JSON-encoded object with a `status` field (`"completed"` or `"failed"`) and an optional `output` field with an error message.
+For `shell`, `output` is a JSON-encoded `ShellResult` containing the command's stdout, stderr, and outcome (exit code or timeout). For `create_file`, `edit_file`, and `delete_file`, `output` is a JSON-encoded object with a `status` field (`"completed"` or `"failed"`) and an optional `output` field with an error message.
 
 ### `event.dropped.v1`
 
@@ -928,16 +928,16 @@ This tool is not exposed when the `file` modality is disabled (see [Input Modali
 
 ### Built-in Tool: `shell`
 
-Executes shell commands sequentially inside the workspace sandbox. Each command runs as `sh -c <command>`. Commands do not share state between calls.
+Executes a shell command inside the workspace sandbox. The command runs as `sh -c <command>`. State is not shared between calls.
 
 ```
-shell(commands: string[], timeout_ms?: number)
+shell(command: string, timeout_ms?: number)
 ```
 
 | Parameter | Description |
 |---|---|
-| `commands` | Shell commands to execute in order |
-| `timeout_ms` | Per-command timeout in milliseconds (default: 30000) |
+| `command` | Shell command to execute |
+| `timeout_ms` | Timeout in milliseconds (default: 30000) |
 
 The sandbox grants read-write access to `$JUSTCLAW_HOME/workspace/`, read-write access to the character directory, read-write access to the runtime modules directory, read-write access to the skills directory (when configured), and read-only access to `$JUSTCLAW_HOME/history/`. After each invocation the core emits a `tool_call.v1` notification to the current delivery target.
 

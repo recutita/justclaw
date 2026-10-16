@@ -137,13 +137,9 @@ function formatToolCall(
 	if (
 		toolName === "shell" &&
 		isRecord(input) &&
-		Array.isArray(input.commands)
+		typeof input.command === "string"
 	) {
-		for (const cmd of input.commands) {
-			if (typeof cmd === "string") {
-				lines.push(`[shell] $ ${cmd}`);
-			}
-		}
+		lines.push(`[shell] $ ${input.command}`);
 		try {
 			const result = JSON.parse(outputStr) as unknown;
 			if (isRecord(result) && Array.isArray(result.output)) {
