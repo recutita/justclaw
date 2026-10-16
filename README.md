@@ -172,7 +172,7 @@ Cron expressions are 5-field and evaluated in UTC.
 
 ### Sandbox
 
-Each module runs inside a platform sandbox (`bwrap` on Linux, `sandbox-exec` on macOS). The sandbox grants read-write access to the module's own directory (`modules/{name}/`) and temp paths. Modules cannot access each other's directories or the workspace directly.
+Each module runs inside a platform sandbox (`bwrap` on Linux, `sandbox-exec` on macOS). The sandbox grants read-write access to the module's own directory (`modules/{name}/`) and a private temp directory created by the core; the host `/tmp` is not exposed. Modules cannot access each other's directories or the workspace directly.
 
 The `shell`, `create_file`, `edit_file`, and `delete_file` built-in tools run in a separate workspace sandbox that grants read-write access to the workspace, character, and modules directories, and read-only access to the history directory.
 

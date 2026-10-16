@@ -1,4 +1,11 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import {
+	afterAll,
+	afterEach,
+	beforeEach,
+	describe,
+	expect,
+	test,
+} from "bun:test";
 import {
 	chmod,
 	mkdir,
@@ -37,6 +44,7 @@ import {
 	createLinuxBubblewrapCommand,
 	createLinuxWorkspaceBwrapCommand,
 	createSandboxLaunchSpec,
+	removeSandboxTmpDir,
 	resolveSandboxBackend,
 	type SandboxLaunchSpec,
 } from "./sandbox";
@@ -50,6 +58,11 @@ const originalOpenAIAPI = process.env.JUSTCLAW_OPENAI_API;
 beforeEach(() => {
 	delete process.env.JUSTCLAW_HOME;
 	delete process.env.JUSTCLAW_OPENAI_API;
+});
+
+// Sandboxes spawned or built here create the process-wide temp dir on first use.
+afterAll(() => {
+	removeSandboxTmpDir();
 });
 
 afterEach(async () => {
@@ -835,28 +848,62 @@ describe("sandbox", () => {
 		);
 	});
 
-	test("builds a darwin profile with module and temp write access", () => {
-		const profile = createDarwinSandboxProfile("/tmp/module");
+	test("builds a darwin profile with module and private temp write access", () => {
+		const profile = createDarwinSandboxProfile(
+			"/tmp/module",
+			process.env,
+			[],
+			[],
+			"/private/var/folders/example/T/justclaw-abc",
+		);
 		expect(profile).toContain('(subpath "/tmp/module")');
 		expect(profile).toContain('(subpath "/System")');
 		expect(profile).toContain('(subpath "/usr")');
 		expect(profile).toContain('(subpath "/opt")');
 		expect(profile).toContain('(subpath "/Library")');
 		expect(profile).toContain('(subpath "/private/etc")');
-		expect(profile).toContain('(subpath "/tmp")');
-		expect(profile).toContain('(subpath "/private/tmp")');
+		const writeSection = profile.slice(profile.indexOf("(allow file-write*"));
+		expect(writeSection).toContain(
+			'(subpath "/private/var/folders/example/T/justclaw-abc")',
+		);
+		expect(writeSection).toContain(
+			'(subpath "/var/folders/example/T/justclaw-abc")',
+		);
 		expect(profile).not.toContain('(subpath "/")');
 		expect(profile).toContain("(allow network*)");
 	});
 
-	test("includes inherited TMPDIR in the darwin profile", () => {
-		const profile = createDarwinSandboxProfile("/tmp/module", {
-			...process.env,
-			TMPDIR: "/var/folders/example/T/",
+	test("does not expose the host temp paths in the darwin profile", () => {
+		const profile = createDarwinSandboxProfile(
+			"/Users/dev/justclaw/modules/example",
+			{ ...process.env, TMPDIR: "/var/folders/example/T/" },
+			[],
+			[],
+			"/private/var/folders/example/T/justclaw-abc",
+		);
+
+		expect(profile).not.toContain('(subpath "/tmp")');
+		expect(profile).not.toContain('(subpath "/private/tmp")');
+		expect(profile).not.toContain('(subpath "/var/folders/example/T")');
+		expect(profile).not.toContain('(subpath "/private/var/folders/example/T")');
+	});
+
+	test("darwin module sandbox points TMPDIR at the private temp dir", async () => {
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
 		});
 
-		expect(profile).toContain('(subpath "/var/folders/example/T")');
-		expect(profile).toContain('(subpath "/private/var/folders/example/T")');
+		const spec = await createSandboxLaunchSpec(manifest, {
+			platform: "darwin",
+			env: { PATH: "/usr/bin", TMPDIR: "/var/folders/example/T/" },
+			lookupExecutable: async () => "/usr/bin/sandbox-exec",
+			pathExists: async () => false,
+			tmpDir: "/private/var/folders/example/T/justclaw-abc",
+		});
+
+		expect(spec.env.TMPDIR).toBe("/private/var/folders/example/T/justclaw-abc");
 	});
 
 	test("darwin module sandbox exposes JUSTCLAW_SANDBOX_RO_PATHS as read-only", async () => {
@@ -1267,9 +1314,35 @@ describe("sandbox", () => {
 
 		await expect(
 			createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
-				pathExists: async (candidatePath) => candidatePath === "/tmp/example",
+				pathExists: async () => false,
+				tmpDir: "/tmp/justclaw-abc",
 			}),
-		).rejects.toThrow("Required writable sandbox path is unavailable: /tmp");
+		).rejects.toThrow(
+			"Required writable sandbox path is unavailable: /tmp/example",
+		);
+	});
+
+	test("binds the private temp dir at /tmp before any other linux module mount", async () => {
+		const manifest = parseDaemonManifest("/tmp/example", "example", {
+			name: "example",
+			exec: "./run",
+			mode: "daemon",
+		});
+
+		const cmd = await createLinuxBubblewrapCommand("/usr/bin/bwrap", manifest, {
+			pathExists: async (candidatePath) =>
+				candidatePath === "/tmp" || candidatePath === "/tmp/example",
+			tmpDir: "/tmp/justclaw-abc",
+		});
+
+		const joined = cmd.join(" ");
+		expect(joined).toContain("--bind /tmp/justclaw-abc /tmp");
+		expect(joined).not.toContain("--bind /tmp /tmp");
+		// A module dir under the host /tmp is mounted on top of the private
+		// /tmp, not shadowed by it.
+		expect(joined.indexOf("--bind /tmp/justclaw-abc /tmp")).toBeLessThan(
+			joined.indexOf("--bind /tmp/example /tmp/example"),
+		);
 	});
 
 	test("fails closed when the darwin backend is missing", async () => {

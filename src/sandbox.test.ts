@@ -1,11 +1,17 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import type { DaemonModuleManifest } from "./module-manifest";
 import {
 	createDarwinWorkspaceSandboxProfile,
 	createLinuxBubblewrapCommand,
 	createLinuxWorkspaceBwrapCommand,
 	createWorkspaceSandboxBaseCommand,
+	removeSandboxTmpDir,
 } from "./sandbox";
+
+// Sandboxes spawned or built here create the process-wide temp dir on first use.
+afterAll(() => {
+	removeSandboxTmpDir();
+});
 
 describe("workspace sandbox profiles", () => {
 	test("darwin workspace profile includes workspace and history read, workspace write", () => {
@@ -363,6 +369,21 @@ describe("workspace sandbox environment allowlist", () => {
 		expect(spec.env.MISSING).toBeUndefined();
 		// JUSTCLAW_SANDBOX_ENV names variables to let through; it does not name itself.
 		expect(spec.env.JUSTCLAW_SANDBOX_ENV).toBeUndefined();
+	});
+
+	test("linux workspace sandbox binds the private temp dir at /tmp, not the host /tmp", async () => {
+		const spec = await createWorkspaceSandboxBaseCommand("/ws", "/hist", {
+			platform: "linux",
+			env: { PATH: "/usr/bin" },
+			pathExists: async (p) => p === "/tmp" || p === "/ws",
+			realPath: async (p) => p,
+			lookupExecutable: async (command) =>
+				command === "bwrap" ? "/usr/bin/bwrap" : null,
+			tmpDir: "/tmp/justclaw-abc",
+		});
+		const joined = spec.cmdPrefix.join(" ");
+		expect(joined).toContain("--bind /tmp/justclaw-abc /tmp");
+		expect(joined).not.toContain("--bind /tmp /tmp");
 	});
 
 	test("linux workspace sandbox still forces TMPDIR to /tmp regardless of host TMPDIR", async () => {
