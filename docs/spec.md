@@ -105,6 +105,20 @@ For `tool/{name}` responses, the top-level `result.type` field is reserved by th
 | `file` | `result.file.data` is treated as base64 file bytes. In Responses mode it is passed to the LLM as a file tool result; in Chat Completions mode it is queued as `file.send.v1` for the next LLM cycle and the current tool result is text metadata. Metadata only when the `file` modality is disabled (see [Input Modalities](#input-modalities)). |
 | anything else | The whole `result` is converted with `JSON.stringify(result)`. |
 
+An `image` or `file` result may also carry `text`, a non-empty string that reaches the LLM in the same tool result as the media. This lets a tool return a status and what it saw from one call:
+
+```json
+{ "type": "image", "text": "blocked", "image": { "data": "<base64>", "mediaType": "image/png" } }
+```
+
+| Path | Current tool result |
+|---|---|
+| Responses mode, modality enabled | `text` followed by the media, as one tool result with two parts (`input_text`, then `input_image` or `input_file`) |
+| Chat Completions mode | The text metadata above with `text` added; the media is queued for the next cycle as usual |
+| Modality disabled | The metadata with `unsupported: true` and `text` added |
+
+Only the media follows the delay and modality rules, because a status like `blocked` is what the model needs to choose its next call and must not wait a cycle for the image. Endpoints vary in accepting a multi-part function call output; vLLM does.
+
 Image and file results may include `mediaType`, `filename` (files), and `link`. The core records metadata for media tool results: `type`, `filename` when present, `mediaType`, `size`, `sha256`, `link` when present, and `attachable`. `attachable` is true only when `link` names a readable regular file on the host at the time the result is processed.
 
 Inline image data is stored in session history. Inline file and audio data are not: before session history is stored, the core replaces every `input_file` and `audio` byte payload with metadata plus `omitted: "data"`, regardless of whether the payload came from an event envelope, a built-in attach tool, or a module tool result. If a module expects the LLM to read the same file again in later turns, the module should keep the file under its module directory and return a readable `link` so the LLM can call `attach_file` again.
