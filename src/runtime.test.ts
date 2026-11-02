@@ -4586,6 +4586,7 @@ for await (const chunk of Bun.stdin.stream()) {
 				sha256: imageSha,
 				link: imagePath,
 			},
+			detail: "auto",
 			providerData: {
 				justclaw: {
 					metadata: {

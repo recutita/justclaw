@@ -666,7 +666,13 @@ async function prepareImageToolResult(
 			sha256: metadata.sha256,
 			...(typeof link === "string" && link.length > 0 ? { link } : {}),
 		},
-		...(typeof result.detail === "string" ? { detail: result.detail } : {}),
+		// The SDK fills in `detail` for images in messages but not in tool
+		// results, and vLLM's Responses API rejects an `input_image` without it.
+		// "auto" is OpenAI's own default, so OpenAI sees no change.
+		detail:
+			typeof result.detail === "string" && result.detail.length > 0
+				? result.detail
+				: "auto",
 		providerData: attachProviderMetadata(result.providerData, metadata),
 	};
 }
@@ -763,9 +769,13 @@ function mediaToolMetadata(
 	return metadata;
 }
 
-function delayedMediaToolOutput(result: Record<string, unknown>): string {
+function delayedMediaToolOutput(
+	result: Record<string, unknown>,
+	text: string | undefined,
+): string {
 	return JSON.stringify({
 		type: result.type,
+		...(text !== undefined ? { text } : {}),
 		delayed: true,
 		message:
 			"Media was queued as a multimodal event and will be available in the next LLM cycle.",
@@ -773,9 +783,13 @@ function delayedMediaToolOutput(result: Record<string, unknown>): string {
 	});
 }
 
-function unsupportedMediaToolOutput(result: Record<string, unknown>): string {
+function unsupportedMediaToolOutput(
+	result: Record<string, unknown>,
+	text: string | undefined,
+): string {
 	return JSON.stringify({
 		type: result.type,
+		...(text !== undefined ? { text } : {}),
 		unsupported: true,
 		message:
 			"The configured model endpoint does not accept this input modality, so the bytes were not sent. Only the metadata below is available.",
@@ -783,28 +797,31 @@ function unsupportedMediaToolOutput(result: Record<string, unknown>): string {
 	});
 }
 
+// `text` goes out in the current tool result on every path; only the media
+// follows the delay and modality rules. A status such as "blocked" must reach
+// the model in the same cycle as the call that produced it, even when the
+// image cannot.
 function maybeDelayMediaToolResult(
 	result: Record<string, unknown>,
+	text: string | undefined,
 	delivery?: ToolResultDelivery,
 ): unknown {
-	if (!delivery) {
-		return result;
+	const event = delivery ? mediaEventFromToolResult(result) : null;
+	if (delivery && event) {
+		const modality = event.type === "image.send.v1" ? "image" : "file";
+		if (!delivery.inputModalities.has(modality)) {
+			// Not enqueued as a media event either: the next cycle would build the
+			// same rejected content part and drop that event too.
+			return unsupportedMediaToolOutput(result, text);
+		}
+		if (delivery.apiMode === "chat_completions") {
+			// Chat Completions tool messages carry text only, so the SDK would drop
+			// an array's media part; keep returning a string here.
+			delivery.enqueueMedia(event);
+			return delayedMediaToolOutput(result, text);
+		}
 	}
-	const event = mediaEventFromToolResult(result);
-	if (!event) {
-		return result;
-	}
-	const modality = event.type === "image.send.v1" ? "image" : "file";
-	if (!delivery.inputModalities.has(modality)) {
-		// Not enqueued as a media event either: the next cycle would build the
-		// same rejected content part and drop that event too.
-		return unsupportedMediaToolOutput(result);
-	}
-	if (delivery.apiMode !== "chat_completions") {
-		return result;
-	}
-	delivery.enqueueMedia(event);
-	return delayedMediaToolOutput(result);
+	return text !== undefined ? [{ type: "text", text }, result] : result;
 }
 
 async function prepareToolResultForLlm(
@@ -820,16 +837,20 @@ async function prepareToolResultForLlm(
 			type === "json" && "data" in result ? result.data : result,
 		);
 	}
+	const text =
+		typeof result.text === "string" && result.text.length > 0
+			? result.text
+			: undefined;
 	if (type === "image") {
 		const prepared = await prepareImageToolResult(result);
 		return prepared
-			? maybeDelayMediaToolResult(prepared, delivery)
+			? maybeDelayMediaToolResult(prepared, text, delivery)
 			: JSON.stringify(result);
 	}
 	if (type === "file") {
 		const prepared = await prepareFileToolResult(result);
 		return prepared
-			? maybeDelayMediaToolResult(prepared, delivery)
+			? maybeDelayMediaToolResult(prepared, text, delivery)
 			: JSON.stringify(result);
 	}
 	return JSON.stringify(result);
@@ -980,47 +1001,49 @@ export function sanitizeHistoryForStorage(
 	});
 }
 
+// Drops the bytes from a media tool output so the notification carries only
+// what identifies it.
+function notificationView(output: unknown): unknown {
+	if (!isRecord(output)) {
+		return output;
+	}
+	if (output.type === "image" && isRecord(output.image)) {
+		const image = output.image;
+		return {
+			type: "image",
+			image: {
+				mediaType: image.mediaType,
+				size: image.size,
+				sha256: image.sha256,
+				link: image.link,
+			},
+		};
+	}
+	if (output.type === "file" && isRecord(output.file)) {
+		const file = output.file;
+		return {
+			type: "file",
+			file: {
+				filename: file.filename,
+				mediaType: file.mediaType,
+				size: file.size,
+				sha256: file.sha256,
+				link: file.link,
+			},
+		};
+	}
+	return output;
+}
+
 function summarizeToolOutputForNotification(output: unknown): string {
-	if (
-		typeof output === "object" &&
-		output !== null &&
-		(output as { type?: unknown }).type === "image"
-	) {
-		const image = (output as { image?: unknown }).image;
-		if (typeof image === "object" && image !== null) {
-			const record = image as Record<string, unknown>;
-			return JSON.stringify({
-				type: "image",
-				image: {
-					mediaType: record.mediaType,
-					size: record.size,
-					sha256: record.sha256,
-					link: record.link,
-				},
-			});
-		}
+	if (typeof output === "string") {
+		return output;
 	}
-	if (
-		typeof output === "object" &&
-		output !== null &&
-		(output as { type?: unknown }).type === "file"
-	) {
-		const file = (output as { file?: unknown }).file;
-		if (typeof file === "object" && file !== null) {
-			const record = file as Record<string, unknown>;
-			return JSON.stringify({
-				type: "file",
-				file: {
-					filename: record.filename,
-					mediaType: record.mediaType,
-					size: record.size,
-					sha256: record.sha256,
-					link: record.link,
-				},
-			});
-		}
-	}
-	return typeof output === "string" ? output : JSON.stringify(output);
+	return JSON.stringify(
+		Array.isArray(output)
+			? output.map(notificationView)
+			: notificationView(output),
+	);
 }
 
 function wrapWithNotification(

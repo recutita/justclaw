@@ -1002,6 +1002,7 @@ describe("runLlmLoop", () => {
 					sha256,
 					link: imagePath,
 				},
+				detail: "auto",
 				providerData: {
 					justclaw: {
 						metadata: {
@@ -3054,4 +3055,147 @@ for await (const chunk of Bun.stdin.stream()) {
 
 		expect(capturedInputs.some((i) => i.includes(initMarker))).toBe(true);
 	}, 20000);
+});
+
+describe("module media tool results with text", () => {
+	const tinyPngBase64 =
+		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+
+	// Runs one cycle in which the LLM calls `mod__look`, whose module returns
+	// `result`, plus a second cycle if the first queued media for it.
+	async function callLook(result: Record<string, unknown>): Promise<{
+		toolOutput: unknown;
+		notifiedOutput: string | undefined;
+		secondInput: unknown;
+	}> {
+		const home = await createTempDir("justclaw-media-text-");
+		const queue = new EventQueue(path.join(home, "events.db"));
+		queue.enqueue("mod", { type: "event.v1", kind: "test" });
+		let notifiedOutput: string | undefined;
+		const daemons = [
+			{
+				manifest: { name: "mod" },
+				tools: [
+					{ name: "look", parameters: { type: "object", properties: {} } },
+				],
+				peer: {
+					request: async () => result,
+					notify: (method: string, params: unknown) => {
+						const p = params as { type?: string; output?: string };
+						if (method === "event" && p.type === "tool_call.v1") {
+							notifiedOutput = p.output;
+						}
+					},
+				},
+			},
+		] as unknown as StartedDaemon[];
+		const rc = new RunContext();
+		let toolOutput: unknown;
+		let secondInput: unknown;
+		let runCount = 0;
+		const mockRunner = {
+			run: async (agent: Agent, input: unknown) => {
+				runCount += 1;
+				if (runCount === 1) {
+					toolOutput = await findFunctionTool(agent, "mod__look").invoke(
+						rc,
+						"{}",
+					);
+				} else {
+					secondInput = input;
+				}
+				return { finalOutput: null, history: [] };
+			},
+		} as unknown as Runner;
+		const loopTask = runLlmLoop(queue, { current: daemons }, "test-model", {
+			runner: mockRunner,
+		});
+		await waitUntil(() => toolOutput !== undefined);
+		// Give a queued media event the chance to start a second cycle.
+		await delay(50);
+		queue.close();
+		await loopTask;
+		return { toolOutput, notifiedOutput, secondInput };
+	}
+
+	const lookResult = {
+		type: "image",
+		text: "blocked",
+		image: { data: tinyPngBase64, mediaType: "image/png" },
+	};
+
+	test("Responses mode returns the text before the image in one tool result", async () => {
+		process.env.JUSTCLAW_OPENAI_API = "responses";
+		const { toolOutput, notifiedOutput } = await callLook(lookResult);
+
+		expect(Array.isArray(toolOutput)).toBe(true);
+		const [text, image] = toolOutput as Record<string, unknown>[];
+		expect(text).toEqual({ type: "text", text: "blocked" });
+		expect(image).toMatchObject({
+			type: "image",
+			image: { data: tinyPngBase64 },
+		});
+
+		// The tool_call.v1 notification carries the text but not the bytes.
+		expect(notifiedOutput).toContain("blocked");
+		expect(notifiedOutput).toContain("image/png");
+		expect(notifiedOutput).not.toContain(tinyPngBase64);
+	});
+
+	test("Responses mode without text keeps the single image result", async () => {
+		process.env.JUSTCLAW_OPENAI_API = "responses";
+		const { toolOutput } = await callLook({
+			type: "image",
+			image: { data: tinyPngBase64, mediaType: "image/png" },
+		});
+
+		expect(Array.isArray(toolOutput)).toBe(false);
+		expect((toolOutput as { type?: string }).type).toBe("image");
+	});
+
+	test("keeps a module's detail and defaults it to auto otherwise", async () => {
+		// vLLM's Responses API rejects an input_image tool output without detail.
+		process.env.JUSTCLAW_OPENAI_API = "responses";
+		const withDetail = await callLook({
+			type: "image",
+			detail: "high",
+			image: { data: tinyPngBase64, mediaType: "image/png" },
+		});
+		expect(withDetail.toolOutput).toMatchObject({ detail: "high" });
+
+		const [, image] = (await callLook(lookResult)).toolOutput as unknown[];
+		expect(image).toMatchObject({ detail: "auto" });
+	});
+
+	test("Chat Completions mode returns the text now and queues the image", async () => {
+		process.env.JUSTCLAW_OPENAI_API = "chat_completions";
+		const { toolOutput, secondInput } = await callLook(lookResult);
+
+		expect(typeof toolOutput).toBe("string");
+		const output = JSON.parse(toolOutput as string) as Record<string, unknown>;
+		expect(output.text).toBe("blocked");
+		expect(output.delayed).toBe(true);
+		expect(toolOutput as string).not.toContain(tinyPngBase64);
+
+		const imageEvent = (secondInput as AgentInputItem[])[0] as {
+			content: Array<{ type: string; image?: string }>;
+		};
+		expect(imageEvent.content[1]).toEqual({
+			type: "input_image",
+			image: `data:image/png;base64,${tinyPngBase64}`,
+		});
+	});
+
+	test("a disabled image modality still returns the text", async () => {
+		process.env.JUSTCLAW_OPENAI_API = "responses";
+		process.env.JUSTCLAW_OPENAI_INPUT_MODALITIES = "none";
+		const { toolOutput, secondInput } = await callLook(lookResult);
+
+		expect(typeof toolOutput).toBe("string");
+		const output = JSON.parse(toolOutput as string) as Record<string, unknown>;
+		expect(output.text).toBe("blocked");
+		expect(output.unsupported).toBe(true);
+		expect(toolOutput as string).not.toContain(tinyPngBase64);
+		expect(secondInput).toBeUndefined();
+	});
 });
