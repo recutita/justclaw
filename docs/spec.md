@@ -119,7 +119,7 @@ An `image` or `file` result may also carry `text`, a non-empty string that reach
 
 Only the media follows the delay and modality rules, because a status like `blocked` is what the model needs to choose its next call and must not wait a cycle for the image. Endpoints vary in accepting a multi-part function call output; vLLM does.
 
-Image and file results may include `mediaType`, `filename` (files), and `link`. The core records metadata for media tool results: `type`, `filename` when present, `mediaType`, `size`, `sha256`, `link` when present, and `attachable`. `attachable` is true only when `link` names a readable regular file on the host at the time the result is processed.
+Image and file results may include `mediaType`, `filename` (files), and `link`. Image results may also include `detail` (`low`, `high`, `auto`); the core sends `auto` when it is omitted, because vLLM's Responses API rejects an image tool result without it. The core records metadata for media tool results: `type`, `filename` when present, `mediaType`, `size`, `sha256`, `link` when present, and `attachable`. `attachable` is true only when `link` names a readable regular file on the host at the time the result is processed.
 
 Inline image data is stored in session history. Inline file and audio data are not: before session history is stored, the core replaces every `input_file` and `audio` byte payload with metadata plus `omitted: "data"`, regardless of whether the payload came from an event envelope, a built-in attach tool, or a module tool result. If a module expects the LLM to read the same file again in later turns, the module should keep the file under its module directory and return a readable `link` so the LLM can call `attach_file` again.
 

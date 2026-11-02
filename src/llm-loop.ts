@@ -665,7 +665,13 @@ async function prepareImageToolResult(
 			sha256: metadata.sha256,
 			...(typeof link === "string" && link.length > 0 ? { link } : {}),
 		},
-		...(typeof result.detail === "string" ? { detail: result.detail } : {}),
+		// The SDK fills in `detail` for images in messages but not in tool
+		// results, and vLLM's Responses API rejects an `input_image` without it.
+		// "auto" is OpenAI's own default, so OpenAI sees no change.
+		detail:
+			typeof result.detail === "string" && result.detail.length > 0
+				? result.detail
+				: "auto",
 		providerData: attachProviderMetadata(result.providerData, metadata),
 	};
 }

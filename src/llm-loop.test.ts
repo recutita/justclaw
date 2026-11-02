@@ -983,6 +983,7 @@ describe("runLlmLoop", () => {
 					sha256,
 					link: imagePath,
 				},
+				detail: "auto",
 				providerData: {
 					justclaw: {
 						metadata: {
@@ -3130,6 +3131,20 @@ describe("module media tool results with text", () => {
 
 		expect(Array.isArray(toolOutput)).toBe(false);
 		expect((toolOutput as { type?: string }).type).toBe("image");
+	});
+
+	test("keeps a module's detail and defaults it to auto otherwise", async () => {
+		// vLLM's Responses API rejects an input_image tool output without detail.
+		process.env.JUSTCLAW_OPENAI_API = "responses";
+		const withDetail = await callLook({
+			type: "image",
+			detail: "high",
+			image: { data: tinyPngBase64, mediaType: "image/png" },
+		});
+		expect(withDetail.toolOutput).toMatchObject({ detail: "high" });
+
+		const [, image] = (await callLook(lookResult)).toolOutput as unknown[];
+		expect(image).toMatchObject({ detail: "auto" });
 	});
 
 	test("Chat Completions mode returns the text now and queues the image", async () => {
